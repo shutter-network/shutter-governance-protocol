@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vitest/config";
 
 // Tests run in Node, where the crypto SDK's ES-module build cannot load its WASM (it
@@ -8,6 +9,12 @@ import { defineConfig } from "vitest/config";
 const sdkCjs = createRequire(import.meta.url).resolve("@shutter-network/urban-verified-crypto");
 
 export default defineConfig({
-  resolve: { alias: { "@shutter-network/urban-verified-crypto": sdkCjs } },
+  resolve: {
+    alias: {
+      "@shutter-network/urban-verified-crypto": sdkCjs,
+      // The workspace package, resolved the way the apps' Vite configs resolve it.
+      "@shutter-governance-protocol/shared": fileURLToPath(new URL("./shared/src", import.meta.url)),
+    },
+  },
   test: { server: { deps: { external: [/urban-verified-crypto/] } } },
 });

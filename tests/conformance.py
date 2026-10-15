@@ -428,6 +428,17 @@ class DataLayerConformance:
             backend.dl("keyper1").submit_dkg_result(ELECTION_ID, pk2, com2, backend.dkg_sig("keyper1", pk2, com2))
         assert len(backend.reader().get_dkg_submissions(ELECTION_ID)) == 1
 
+    def test_dkg_vote_after_voting_start_rejected(self, backend):
+        """A late vote could finalize the key of an election that had already failed
+        (DKGFailed) for lack of one. An identical resend stays a no-op."""
+        backend.register()
+        pk, committee = backend.pk_and_committee()
+        backend.dl("keyper1").submit_dkg_result(ELECTION_ID, pk, committee, backend.dkg_sig("keyper1", pk, committee))
+        backend.set_time(backend.config.voting_start)
+        with pytest.raises(VotingWindowError):
+            backend.dl("keyper2").submit_dkg_result(ELECTION_ID, pk, committee, backend.dkg_sig("keyper2", pk, committee))
+        assert backend.reader().get_finalized_key(ELECTION_ID) is None
+
     # -- decryption shares: authz + idempotency ---------------------------- #
 
     def _finalize_aggregate(self, backend):

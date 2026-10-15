@@ -41,13 +41,23 @@ class AuditReport:
 
 
 def _submitter_index(cfg, election_id: bytes, submission) -> int | None:
-    """Recover the DKG submitter from its content signature (see shutter_governance_protocol.write_auth)."""
-    try:
-        recovered = write_auth.recover_digest(
-            write_auth.dkg_result_digest(election_id, submission.pk_election, list(submission.committee_pks)),
-            submission.keyper_signature,
-        )
-    except Exception:  # noqa: BLE001
+    """Recover the DKG submitter from its content signature (see shutter_governance_protocol.write_auth).
+
+    A vote with no signature can still carry the address its backend authenticated
+    (``submission.submitter``: on chain, the contract's ``msg.sender`` for a keyper that
+    sent its own transaction). That is used only when there is no signature to check.
+    """
+    if not submission.keyper_signature:
+        recovered = submission.submitter
+    else:
+        try:
+            recovered = write_auth.recover_digest(
+                write_auth.dkg_result_digest(election_id, submission.pk_election, list(submission.committee_pks)),
+                submission.keyper_signature,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+    if recovered is None:
         return None
     for i, k in enumerate(cfg.keypers, start=1):
         if k.signing_key == recovered:
@@ -133,7 +143,9 @@ def audit(dl: ElectionDataLayer, election_id: bytes) -> AuditReport:
     # The bound is derivable from the aggregate, so a mismatch here narrows a
     # discrepancy to "published against a different admitted set" instead of leaving
     # it as a bare disagreement.
-    expected_bound = bsgs_bound(cfg, published_agg.total_admitted_weight)
+    # The scaled total: the tally searches budget × Σ(scaled weights), and the raw total
+    # differs from it whenever scale > 1.
+    expected_bound = bsgs_bound(cfg, published_agg.total_scaled_weight)
     if published_result.bsgs_bound != expected_bound:
         report.discrepancies.append(
             f"result: published BSGS bound {published_result.bsgs_bound} "

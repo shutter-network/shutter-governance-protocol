@@ -4,7 +4,7 @@
  * topbar + election dropdown). Live crypto verification is deferred: automatic ballot
  * verification and per-share DLEQ verify are disabled; the "Verify yourself" guide panels
  * (instructional + fixture download) stay. */
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import "./i18n";
@@ -227,6 +227,10 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
   const [showVerifyPanel, setShowVerifyPanel] = useState(false);
 
   const [page, setPage] = useState(0);
+  // The poll below reads the page the user is on through this ref, so it refreshes that
+  // page instead of overwriting it with page 0 every 5 s.
+  const pageRef = useRef(0);
+  pageRef.current = page;
   const [ballotsTotal, setBallotsTotal] = useState<bigint>(0n);
   const [ballots, setBallots] = useState<Ballot[]>([]);
   const [ballotsLoading, setBallotsLoading] = useState(false);
@@ -248,23 +252,26 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
   // ── data loading (initial + poll) ──
   useEffect(() => {
     let alive = true;
-    setTab("overview"); setPage(0); setDetailView(null); setShowVerifyGuide(false); setShowVerifyPanel(false);
+    setTab("overview"); setPage(0); pageRef.current = 0; setDetailView(null); setShowVerifyGuide(false); setShowVerifyPanel(false);
     setOverview(null); setAggregate(null); setShares(null); setResult(null);
     setBallotVerify({}); setShareVerify({}); setDedup(EMPTY_DEDUP);
     async function load() {
       try {
-        const [ov, agg, sh, res, firstPage] = await Promise.all([
+        const shownPage = pageRef.current;
+        const [ov, agg, sh, res, current] = await Promise.all([
           fetchElectionOverview(electionId), fetchAggregate(electionId), fetchDecryptionShares(electionId),
-          fetchResult(electionId), fetchBallotsPage(electionId, 0, PAGE_SIZE),
+          fetchResult(electionId), fetchBallotsPage(electionId, shownPage * PAGE_SIZE, PAGE_SIZE),
         ]);
         if (!alive) return;
         setLoadError(null); setOverview(ov); setAggregate(agg); setShares(sh); setResult(res);
-        setBallotsTotal(firstPage.total); setOverviewBallotTotal(firstPage.total);
-        setBallots(firstPage.ballots);
+        setBallotsTotal(current.total); setOverviewBallotTotal(current.total);
+        // Only if the user is still on the page this poll fetched; a page change in the
+        // meantime has its own fetch (the effect below).
+        if (pageRef.current === shownPage) setBallots(current.ballots);
         // Dedup needs the whole ordered list (a re-vote may span pages). One page suffices
         // when it already holds everything; otherwise fetch the rest.
-        const total = Number(firstPage.total);
-        const all = total <= PAGE_SIZE ? firstPage.ballots : await fetchAllBallotsFor(electionId, total);
+        const total = Number(current.total);
+        const all = total <= PAGE_SIZE && shownPage === 0 ? current.ballots : await fetchAllBallotsFor(electionId, total);
         if (alive) setDedup(computeBallotDedup(all));
       } catch (e) { if (alive) setLoadError(e instanceof Error ? e.message : String(e)); }
     }
@@ -712,7 +719,7 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
                         <p className="blHelpText">Click any ballot to see its cryptographic details (ciphertexts, ZK proof, voter signature, attestation).</p>
                       </>
                     ) : !isTriple ? (
-                      <BallotDetail ballot={detailBallot!} globalIndex={detailView!.globalIndex} verifyState={{ ...(ballotVerify[detailView!.globalIndex] ?? { status: "idle" }), token: 0 } as any} onBack={() => { setDetailView(null); setShowVerifyPanel(false); }} onVerifyLocally={() => void runBallotVerify(detailBallot!, detailView!.globalIndex)} onToggleGuide={() => setShowVerifyPanel((open) => !open)} guideOpen={showVerifyPanel} txHash={null} explorerUrl={undefined} />
+                      <BallotDetail ballot={detailBallot!} globalIndex={detailView!.globalIndex} verifyState={{ ...(ballotVerify[detailView!.globalIndex] ?? { status: "idle" }), token: 0 } as any} onBack={() => { setDetailView(null); setShowVerifyPanel(false); }} onVerifyLocally={() => void runBallotVerify(detailBallot!, detailView!.globalIndex)} onToggleGuide={() => setShowVerifyPanel((open) => !open)} guideOpen={showVerifyPanel} txHash={null} explorerUrl={undefined} scale={overview!.config.scale} />
                     ) : null}
                   </div>
                 )}

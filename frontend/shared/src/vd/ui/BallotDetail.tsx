@@ -25,9 +25,20 @@ type Props = {
   guideOpen: boolean;
   txHash?: string | null;
   explorerUrl?: string;
+  /** The election's scale: the tally counts each weight divided by it, rounded half-up. */
+  scale?: number;
 };
 
-export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerifyLocally, onToggleGuide, guideOpen, txHash, explorerUrl }: Props) {
+/** What the tally counts for a held weight: `(w + s/2) / s`, as `scaled_weight` in Python. */
+export function countedWeight(weight: bigint, scale: bigint): bigint {
+  return (weight + scale / 2n) / scale;
+}
+
+export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerifyLocally, onToggleGuide, guideOpen, txHash, explorerUrl, scale = 1 }: Props) {
+  // The credential's exact weight: `ballot.weight` is a JS number, rounded above 2^53.
+  const exactWeight = ballot.attestation ? BigInt(ballot.attestation.weight) : BigInt(ballot.weight);
+  const scaleN = BigInt(scale);
+  const counted = countedWeight(exactWeight, scaleN);
   const { t } = useTranslation();
   const vs = verifyState.status;
   const iconType = vs === "ok" ? "ok" : vs === "bad" ? "bad" : vs === "verifying" ? "checking" : "idle";
@@ -50,8 +61,9 @@ export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerif
       <div className="bdPseudonymRow">
         <span className="dim">counted at weight</span>
         <span className="mono">
-          {ballot.weight.toLocaleString()}
-          {ballot.weight === 1 ? "" : t(" (each point counts {{n}}x)", { n: ballot.weight })}
+          {counted.toLocaleString()}
+          {counted === 1n ? "" : t(" (each point counts {{n}}x)", { n: counted.toLocaleString() })}
+          {scaleN === 1n ? "" : t(" · held {{w}} ÷ scale {{s}}", { w: exactWeight.toLocaleString(), s: scaleN.toLocaleString() })}
         </span>
       </div>
 

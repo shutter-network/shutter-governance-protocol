@@ -57,6 +57,11 @@ services:
       # the named volume below so re-vote nonces survive restarts — a reset would let a stale
       # ballot outrank a genuine re-vote.
       ELIGIBILITY_NONCE_DB: /eligibility-state/nonces.db
+      # The public API's base URL. The issuer reads each election's config through it, so
+      # an unweighted (one per voter) election is always issued weight 1.
+      SHUTTER_GOVERNANCE_PROTOCOL_API_URL: ${SHUTTER_GOVERNANCE_PROTOCOL_API_URL:-http://host.docker.internal:8500}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Mount the allowlist read-only when one is configured on the host. Harmless when
       # ELIGIBILITY_ALLOWLIST is unset (the file is present but never read).

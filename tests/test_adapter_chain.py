@@ -490,3 +490,229 @@ def test_undecodable_credential_is_read_as_malformed(env, wr):
     assert rows[1].submitted_at is not None
     # The ingest filter keeps working for the next voter.
     assert _max_stored_nonce(env.reader(), ELECTION_ID, b"\x03" * 32) == 0
+
+
+def test_dkg_votes_are_read_back_as_cast(env):
+    """Each vote comes back with the committee it voted for and its submitter: the keyper's
+    own signature for a relayed vote, or the contract-authenticated sender for a vote the
+    keyper sent itself. The read used to return empty signatures and a copied committee."""
+    from shutter_governance_protocol.services.auditor.auditor import _submitter_index
+
+    env.register()
+    pk, committee = env.pk_and_committee()
+    k1 = env.dl("keyper1")
+    k1._send(k1._election(ELECTION_ID).functions.voteDKGResult(pk, committee))  # sent by keyper 1 itself
+    env.dl("keyper2").submit_dkg_result(ELECTION_ID, pk, committee, env.dkg_sig("keyper2", pk, committee))
+
+    subs = env.reader().get_dkg_submissions(ELECTION_ID)
+    assert [s.committee_pks for s in subs] == [tuple(committee)] * 2
+    assert subs[0].keyper_signature == b"" and subs[0].submitter == env._addr("keyper1")
+    assert subs[1].keyper_signature and subs[1].submitter is None
+    assert [_submitter_index(env.config, ELECTION_ID, s) for s in subs] == [1, 2]
+
+
+# --------------------------------------------------------------------------- #
+#  Scale: concurrent writes and large ballot lists
+# --------------------------------------------------------------------------- #
+
+def test_concurrent_writes_from_one_account_are_all_mined(env):
+    """The API relays every ballot from one gateway account, on several threads. Reading the
+    mined nonce without a lock gave two threads the same nonce: 7 of 8 concurrent votes were
+    rejected ("replacement transaction underpriced") and lost."""
+    import threading
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(1100)
+    gw, errors = env.dl("gateway"), []
+
+    def vote(i):
+        try:
+            gw.submit_ballot(ELECTION_ID, env.ballot((i + 1).to_bytes(32, "big")))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=vote, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and gw.count_ballots(ELECTION_ID) == 8
+
+
+def _real_sized_ballot(env, i):
+    """A ballot with a real three-candidate, budget-3 proof size (3147 bytes). The fixture's
+    3-byte proof would understate the gas of reading it back."""
+    import os
+    from dataclasses import replace
+
+    return replace(env.ballot((i + 1).to_bytes(32, "big")), zk_proof=os.urandom(3147))
+
+
+def test_more_than_a_hundred_ballots_read_back_completely(env, monkeypatch):
+    """One getBallots call for a whole page ran out of gas beyond ~83 real-sized ballots, so
+    keypers, the auditor and the API's ingest filter could not read the election. Reads are
+    now chunked, and a chunk that still runs out is halved."""
+    from shutter_governance_protocol.adapters.chain import client as chain_client
+    from shutter_governance_protocol.services.common.reads import read_all_ballots
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(1100)
+    gw = env.dl("gateway")
+    for i in range(100):
+        gw.submit_ballot(ELECTION_ID, _real_sized_ballot(env, i))
+
+    rows = read_all_ballots(env.reader(), ELECTION_ID)
+    assert [r.sequence_number for r in rows] == list(range(100))
+    assert all(r.envelope is not None and len(r.envelope.zk_proof) == 3147 for r in rows)
+
+    # A provider with a 5M eth_call cap: a default chunk (~6.5M) runs out and must halve.
+    reader = env.reader()
+    real_call, out_of_gas = reader.w3.eth.call, []
+
+    def capped(tx, *a, **kw):
+        try:
+            return real_call({**tx, "gas": 5_000_000}, *a, **kw)
+        except Exception as exc:
+            out_of_gas.append(chain_client._is_out_of_gas(exc))
+            raise
+
+    monkeypatch.setattr(reader.w3.eth, "call", capped)
+    assert len(read_all_ballots(reader, ELECTION_ID)) == 100
+    assert out_of_gas and all(out_of_gas)
+
+
+# --------------------------------------------------------------------------- #
+#  Bulky data in event logs, a commitment in storage
+# --------------------------------------------------------------------------- #
+
+def test_ballot_proof_is_stored_as_a_hash_and_read_back_from_its_log(env):
+    """Storage keeps keccak256(zkProof); the proof is in VoteSubmitted. Storing the proof
+    made a real ballot cost ~3.5M gas to cast and ~360k to read."""
+    import os
+    from dataclasses import replace
+
+    from eth_utils import keccak
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(1100)
+    proof = os.urandom(3147)
+    ballot = replace(env.ballot(b"\x01" * 32), zk_proof=proof)
+    env.dl("gateway").submit_ballot(ELECTION_ID, ballot)
+
+    raw = env.reader()._election(ELECTION_ID).functions.getBallots(0, 1).call()
+    assert bytes(raw[0][0][3]) == keccak(proof)  # only the commitment is in storage
+    [row] = env.reader().list_ballots(ELECTION_ID, 0, 1)
+    assert row.envelope == ballot
+
+
+def test_large_budget_ballot_can_be_cast(env):
+    """A budget-100 ballot carries a ~78 KB proof. Stored, it needed ~49M gas, more than a
+    block, so such an election could not be voted in on chain at all."""
+    import os
+    from dataclasses import replace
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(1100)
+    ballot = replace(env.ballot(b"\x01" * 32), zk_proof=os.urandom(3 * 101 * 256 + 64))
+    env.dl("gateway").submit_ballot(ELECTION_ID, ballot)
+    assert env.reader().list_ballots(ELECTION_ID, 0, 1)[0].envelope == ballot
+
+
+def test_aggregate_with_thousands_of_admitted_ballots_becomes_canonical(env):
+    """The quorum vote stored the whole aggregate, at ~22.5k gas per admitted ballot: out of
+    gas past ~1,300. Storage now keeps its digest; the artifact is in AggregatePublished,
+    read back and checked against that digest."""
+    from shutter_governance_protocol.envelopes.types import AggregateArtifact, Ciphertext, Exclusion, ExclusionReason
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(2500)
+    n = 3000
+    agg = AggregateArtifact(
+        election_id=ELECTION_ID,
+        aggregates=tuple(Ciphertext(c1=_b(96, 7), c2=_b(96, 8)) for _ in range(3)),
+        admitted=tuple(range(n)), exclusions=(Exclusion(n, ExclusionReason.MALFORMED),),
+        total_admitted_weight=n, total_scaled_weight=n,
+    )
+    for k in ("keyper1", "keyper2"):
+        env.dl(k).submit_aggregate(ELECTION_ID, agg, env.aggregate_sig(k, agg))
+    assert env.reader().get_aggregate(ELECTION_ID) == agg
+
+
+
+def test_dkg_vote_after_voting_start_is_a_voting_window_error(env):
+    """A late vote used to finalize the key of an election that had already failed."""
+    env.register()
+    pk, committee = env.pk_and_committee()
+    env.dl("keyper1").submit_dkg_result(ELECTION_ID, pk, committee, env.dkg_sig("keyper1", pk, committee))
+    env.warp(1000)  # voting_start
+    with pytest.raises(VotingWindowError):
+        env.dl("keyper2").submit_dkg_result(ELECTION_ID, pk, committee, env.dkg_sig("keyper2", pk, committee))
+    assert env.reader().get_finalized_key(ELECTION_ID) is None
+
+
+def test_log_queries_start_at_the_elections_deploy_block(env):
+    """Proofs, DKG votes and the aggregate come from logs. Scanning from block 0 is slow on a
+    long chain and refused outright by many RPC providers' block-range limits."""
+    env.register()
+    reader = env.reader()
+    election = reader._election(ELECTION_ID)
+    deployed = election.functions.deployBlock().call()
+    assert deployed > 0 and reader._from_block(election) == deployed
+
+
+def test_wei_scale_election_registers_and_reads_back(env):
+    """Token weights are often in wei, so a useful scale is ~1e15. The contract held scale
+    as uint32, so registering one failed (HTTP 500) after the KeyperSet was already paid for."""
+    from dataclasses import replace
+
+    env.config = replace(env.config, weighted=True, scale=10**15)
+    env.register()
+    assert env.reader().get_election(ELECTION_ID).config.scale == 10**15
+
+
+def test_config_the_contract_cannot_hold_fails_before_any_transaction(env, monkeypatch):
+    """The publish call is encoded before the KeyperSet deploy, so the admin pays nothing."""
+    admin = env.dl("admin")
+    real = admin._config_to_params
+    monkeypatch.setattr(admin, "_config_to_params", lambda c: (*real(c)[:3], 2**40, *real(c)[4:]))
+    nonce = env.w3.eth.get_transaction_count(env._addr("admin"))
+    with pytest.raises(ValueError, match="does not fit"):
+        env.register()
+    assert env.w3.eth.get_transaction_count(env._addr("admin")) == nonce
+
+
+def test_concurrent_aggregate_relays_all_land(env):
+    """Every keyper relays its aggregate through the coordinator at the same moment. Each
+    gas estimate saw no quorum yet; the one mined second reached it, did far more work
+    (store the digest, emit the artifact) and ran out of gas. Seen live on chain-devnet."""
+    import threading
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(2500)
+    agg, errors = env.aggregate(), []
+
+    def submit(k):
+        try:
+            env.dl(k).submit_aggregate(ELECTION_ID, agg, env.aggregate_sig(k, agg))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    w3 = env.w3
+    w3.provider.make_request("evm_setAutomine", [False])
+    w3.provider.make_request("evm_setIntervalMining", [1])  # like the devnet: one block a second
+    try:
+        threads = [threading.Thread(target=submit, args=(k,)) for k in ("keyper1", "keyper2", "keyper3")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+    finally:
+        w3.provider.make_request("evm_setIntervalMining", [0])
+        w3.provider.make_request("evm_setAutomine", [True])
+    assert errors == [] and env.reader().get_aggregate(ELECTION_ID) == agg

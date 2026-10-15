@@ -190,6 +190,10 @@ class PostgresStore(ElectionDataLayer):
                 if (prev.pk_election, prev.committee_pks) != (submission.pk_election, submission.committee_pks):
                     raise ImmutabilityError(f"keyper {idx} already submitted a different DKG result")
                 return
+            # A new vote once voting has opened could finalize the key of an election that
+            # has already failed for lack of one (the chain contract refuses it too).
+            if self._clock() >= config.voting_start:
+                raise VotingWindowError("DKG vote submitted after voting_start")
             conn.execute(
                 "INSERT INTO dkg_submissions (election_id, keyper_index, submission) VALUES (%s, %s, %s)",
                 (election_id, idx, Jsonb(codecs.enc_dkg_result(submission))),

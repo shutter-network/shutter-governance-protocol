@@ -24,6 +24,7 @@ and the frontend signature is the gate the service verifies before firing.
 from __future__ import annotations
 
 import logging
+import threading
 
 from shutter_governance_protocol.core import authz
 from shutter_governance_protocol.core.authz import Signer, verify_register, verify_request
@@ -107,8 +108,36 @@ def cancel_election(dl: ElectionDataLayer, election_id: bytes, admin_sig: bytes,
     _LOG.info("op=cancel status=ok election=%s", election_id.hex())
 
 
+class RetryRequests:
+    """Retry requests this admin service has already relayed, so each is used once.
+
+    The memory and database data layers refuse a reused or stale request themselves; the
+    chain adapter sends ``clearTallyStalled`` as the admin's own account and checks
+    neither, so this service is the only gate there. Without it, anyone who saw one retry
+    request could resend it after every later stall, un-stalling the tally and spending
+    the admin's gas each time. Held in memory: after a restart a request could be reused
+    only within what remains of its freshness window.
+    """
+
+    def __init__(self) -> None:
+        self._used: set[tuple[bytes, int]] = set()
+        self._lock = threading.Lock()
+
+    def reserve(self, election_id: bytes, issued_at: int) -> bool:
+        with self._lock:
+            key = (bytes(election_id), int(issued_at))
+            if key in self._used:
+                return False
+            self._used.add(key)
+            return True
+
+    def release(self, election_id: bytes, issued_at: int) -> None:
+        with self._lock:
+            self._used.discard((bytes(election_id), int(issued_at)))
+
+
 def retry_tally(dl: ElectionDataLayer, election_id: bytes, admin_sig: bytes, *, admin_identity: bytes,
-                issued_at: int) -> None:
+                issued_at: int, now: int | None = None, used: RetryRequests | None = None) -> None:
     """Clear a stalled tally (the admin **retry**), authorized by a relayed admin signature.
 
     Verifies ``admin_sig`` (op ``"tally_resume"``) recovers to this election's admin and that
@@ -126,7 +155,17 @@ def retry_tally(dl: ElectionDataLayer, election_id: bytes, admin_sig: bytes, *, 
         raise WriteAuthorizationError(
             "Could not verify that you are this election's administrator. Connect the admin wallet that "
             "registered it and sign again.")
-    dl.set_tally_stalled(election_id, False, admin_sig, issued_at)
+    # Checked after the signature, so unauthenticated requests cannot fill `used`.
+    if now is not None and not authz.request_is_fresh(issued_at, now):
+        raise WriteAuthorizationError("This retry request has expired. Click Retry again to sign a new one.")
+    if used is not None and not used.reserve(election_id, issued_at):
+        raise WriteAuthorizationError("This retry request has already been used. Click Retry again to sign a new one.")
+    try:
+        dl.set_tally_stalled(election_id, False, admin_sig, issued_at)
+    except Exception:
+        if used is not None:
+            used.release(election_id, issued_at)  # not applied, so not spent
+        raise
     _LOG.info("op=retry_tally status=ok election=%s", election_id.hex())
 
 
@@ -209,12 +248,20 @@ def build_admin_app(dl: ElectionDataLayer, admin_identity: bytes, *, clock):
         cancel_election(dl, bytes.fromhex(eid), admin_sig, admin_identity=admin_identity)
         return "", 204
 
+    retry_requests = RetryRequests()
+
     @app.post("/elections/<eid>/tally/retry")
     def retry_tally_route(eid):
         body = request.get_json(force=True)
+        # A missing field must not reach the KeyError handler, which answers "no election".
+        if "signature" not in body or "issuedAt" not in body:
+            raise ValueError("A retry needs both 'signature' and 'issuedAt' (the signing time).")
+        issued_at = body["issuedAt"]
+        if isinstance(issued_at, bool) or not isinstance(issued_at, int) or issued_at < 0:
+            raise ValueError("'issuedAt' must be a non-negative integer (unix seconds).")
         admin_sig = codecs.dec_bytes(body["signature"], name="signature")
         retry_tally(dl, bytes.fromhex(eid), admin_sig, admin_identity=admin_identity,
-                    issued_at=int(body["issuedAt"]))
+                    issued_at=issued_at, now=int(clock()), used=retry_requests)
         return "", 204
 
     return app

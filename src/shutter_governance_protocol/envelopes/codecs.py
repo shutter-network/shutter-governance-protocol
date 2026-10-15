@@ -86,6 +86,27 @@ def _int(value: Any, *, name: str, minimum: int | None = None) -> int:
     return value
 
 
+def _uint_str(n: int) -> str:
+    """An unbounded integer as a decimal string for the wire.
+
+    Weights, nonces and the totals derived from them are sent as strings: a JSON number
+    above 2^53 is rounded by browser JSON parsers, and from 10^21 JavaScript also writes it
+    back in exponent form. Either way a voter would sign, or post, a different number from
+    the one the issuer signed.
+    """
+    return str(int(n))
+
+
+def _big_int(value: Any, *, name: str, minimum: int | None = None) -> int:
+    """Decode a field written by :func:`_uint_str`: a decimal string (digits only), or a
+    JSON integer as earlier versions wrote it, so stored records still decode."""
+    if isinstance(value, str):
+        if not value.isascii() or not value.isdigit():
+            raise CodecError(f"{name}: expected a decimal integer string, got {value!r}")
+        value = int(value)
+    return _int(value, name=name, minimum=minimum)
+
+
 def _list(value: Any, *, name: str) -> list:
     if not isinstance(value, list):
         raise CodecError(f"{name}: expected array, got {type(value).__name__}")
@@ -117,8 +138,8 @@ def enc_attestation(a: Attestation) -> dict:
         "electionId": enc_bytes(a.election_id),
         "pseudonym": enc_bytes(a.pseudonym),
         "vk": enc_bytes(a.vk),
-        "weight": a.weight,
-        "nonce": a.nonce,
+        "weight": _uint_str(a.weight),
+        "nonce": _uint_str(a.nonce),
         "signature": enc_bytes(a.signature),
     }
 
@@ -132,12 +153,12 @@ def dec_attestation(d: Any, *, name: str = "attestation") -> Attestation:
         raise CodecError(f"{name}.scheme: unknown scheme {scheme_raw!r}") from exc
     # 'nonce' is optional on the wire (absent → 1); V1 signatures bind it, so a wrong or
     # missing nonce simply fails signature verification (→ INVALID_ATTESTATION).
-    nonce = _int(d["nonce"], name=f"{name}.nonce", minimum=1) if isinstance(d, dict) and "nonce" in d else 1
+    nonce = _big_int(d["nonce"], name=f"{name}.nonce", minimum=1) if isinstance(d, dict) and "nonce" in d else 1
     return Attestation(
         election_id=dec_bytes(_req(d, "electionId"), name=f"{name}.electionId", size=BYTES32),
         pseudonym=dec_bytes(_req(d, "pseudonym"), name=f"{name}.pseudonym", size=BYTES32),
         vk=dec_bytes(_req(d, "vk"), name=f"{name}.vk", size=G1_BYTES),
-        weight=_int(_req(d, "weight"), name=f"{name}.weight", minimum=1),
+        weight=_big_int(_req(d, "weight"), name=f"{name}.weight", minimum=1),
         signature=dec_bytes(_req(d, "signature"), name=f"{name}.signature", size=SCHNORR_BYTES),
         scheme=scheme,
         nonce=nonce,
@@ -211,6 +232,7 @@ def enc_dkg_result(s: DKGResultSubmission) -> dict:
         "pkElection": enc_bytes(s.pk_election),
         "committeePKs": [enc_bytes(p) for p in s.committee_pks],
         "keyperSignature": enc_bytes(s.keyper_signature),
+        **({"submitter": enc_bytes(s.submitter)} if s.submitter is not None else {}),
     }
 
 
@@ -223,6 +245,7 @@ def dec_dkg_result(d: Any) -> DKGResultSubmission:
             dec_bytes(p, name=f"committeePKs[{i}]", size=G2_BYTES) for i, p in enumerate(pks)
         ),
         keyper_signature=dec_bytes(_req(d, "keyperSignature"), name="keyperSignature"),
+        submitter=dec_bytes(d["submitter"], name="submitter", size=20) if d.get("submitter") else None,
     )
 
 
@@ -268,8 +291,8 @@ def enc_aggregate(a: AggregateArtifact) -> dict:
             {"sequenceNumber": x.sequence_number, "reason": x.reason.value}
             for x in a.exclusions
         ],
-        "totalAdmittedWeight": a.total_admitted_weight,
-        "totalScaledWeight": a.total_scaled_weight,
+        "totalAdmittedWeight": _uint_str(a.total_admitted_weight),
+        "totalScaledWeight": _uint_str(a.total_scaled_weight),
     }
 
 
@@ -300,7 +323,7 @@ def dec_aggregate(d: Any) -> AggregateArtifact:
         exclusions=tuple(
             _dec_exclusion(x, name=f"exclusions[{i}]") for i, x in enumerate(exclusions)
         ),
-        total_admitted_weight=_int(
+        total_admitted_weight=_big_int(
             _req(d, "totalAdmittedWeight"), name="totalAdmittedWeight", minimum=0
         ),
         # Absent means a pre-scale artifact, produced before scaling existed. Those
@@ -308,7 +331,7 @@ def dec_aggregate(d: Any) -> AggregateArtifact:
         # decodes them faithfully rather than rejecting them. See H10: the arity
         # check that distinguishes the two lives in `write_auth`, where a digest
         # mismatch would otherwise read as a bad signature.
-        total_scaled_weight=_int(
+        total_scaled_weight=_big_int(
             d.get("totalScaledWeight", _req(d, "totalAdmittedWeight")),
             name="totalScaledWeight",
             minimum=0,
@@ -323,9 +346,9 @@ def dec_aggregate(d: Any) -> AggregateArtifact:
 def enc_result(r: ResultArtifact) -> dict:
     return {
         "electionId": enc_bytes(r.election_id),
-        "totals": list(r.totals),
+        "totals": [_uint_str(t) for t in r.totals],
         "keyperIndices": list(r.keyper_indices),
-        "bsgsBound": r.bsgs_bound,
+        "bsgsBound": _uint_str(r.bsgs_bound),
     }
 
 
@@ -334,11 +357,11 @@ def dec_result(d: Any) -> ResultArtifact:
     indices = _list(_req(d, "keyperIndices"), name="keyperIndices")
     return ResultArtifact(
         election_id=dec_bytes(_req(d, "electionId"), name="electionId", size=BYTES32),
-        totals=tuple(_int(t, name=f"totals[{i}]", minimum=0) for i, t in enumerate(totals)),
+        totals=tuple(_big_int(t, name=f"totals[{i}]", minimum=0) for i, t in enumerate(totals)),
         keyper_indices=tuple(
             _int(k, name=f"keyperIndices[{i}]", minimum=0) for i, k in enumerate(indices)
         ),
-        bsgs_bound=_int(_req(d, "bsgsBound"), name="bsgsBound", minimum=0),
+        bsgs_bound=_big_int(_req(d, "bsgsBound"), name="bsgsBound", minimum=0),
     )
 
 

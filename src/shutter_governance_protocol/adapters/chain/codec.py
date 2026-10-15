@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+from eth_utils import keccak
+
 from shutter_governance_protocol.core.config import DuplicatePolicy, Mode, Variant
 from shutter_governance_protocol.envelopes import codecs
 from shutter_governance_protocol.envelopes.types import (
@@ -78,18 +80,29 @@ def ballot_to_tuple(env: BallotEnvelope):
             pack_attestation(env.attestation))
 
 
-def ballot_record_from_contract(raw, election_id: bytes, sequence_number: int) -> StoredBallot:
+def ballot_record_from_contract(raw, election_id: bytes, sequence_number: int,
+                                zk_proof: bytes | None) -> StoredBallot:
     """Contract ``BallotRecord``: (ballot, submittedAt, submittedBy) -> StoredBallot.
 
     ``submittedAt`` is the block timestamp the contract stamped at accept time — the
     one adversarially authoritative receive time in the system, since the chain is the
     only backend whose clock the data-layer operator does not control.
+
+    Storage holds only ``keccak256(zkProof)``; ``zk_proof`` is the proof from this
+    ballot's ``VoteSubmitted`` log (``None`` if none was found). It is used only if it
+    matches the stored commitment.
     """
     ballot, submitted_at = raw[0], raw[1]
-    # ``wrAttestation`` is opaque to the contract, so any non-empty bytes are stored.
-    # Bytes that are not a credential must not make the read fail; see StoredBallot.
+    # A record that cannot be turned into a ballot is returned as malformed rather than
+    # failing the read; see StoredBallot. That covers bytes in ``wrAttestation`` that are
+    # not a credential (the contract stores any non-empty bytes there) and a proof that
+    # is missing from the logs or does not match its commitment.
     try:
-        envelope, reason = ballot_from_contract(ballot, election_id), None
+        if zk_proof is None:
+            raise ValueError("proof missing from the VoteSubmitted log")
+        if keccak(zk_proof) != bytes(ballot[3]):
+            raise ValueError("proof does not match its on-chain commitment")
+        envelope, reason = ballot_from_contract(ballot, election_id, zk_proof), None
     except codecs.BALLOT_DECODE_ERRORS as exc:
         envelope, reason = None, f"{type(exc).__name__}: {exc}"
     return StoredBallot(
@@ -100,8 +113,9 @@ def ballot_record_from_contract(raw, election_id: bytes, sequence_number: int) -
     )
 
 
-def ballot_from_contract(raw, election_id: bytes) -> BallotEnvelope:
-    pseudonym, vk, cts, zk_proof, voter_sig, wr = raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]
+def ballot_from_contract(raw, election_id: bytes, zk_proof: bytes) -> BallotEnvelope:
+    """Contract ``BallotView`` plus the proof from its log (``raw[3]`` is only its hash)."""
+    pseudonym, vk, cts, voter_sig, wr = raw[0], raw[1], raw[2], raw[4], raw[5]
     return BallotEnvelope(
         election_id=election_id,
         pseudonym=bytes(pseudonym),

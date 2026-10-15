@@ -73,19 +73,16 @@ contract ElectionTallyTest is Test {
         // First keyper submits — not canonical yet (quorum is t+1 = 2).
         vm.prank(keyper1);
         election.submitAggregate(aggregate);
-        vm.expectRevert(ElectionBase.AggregateNotPublished.selector);
-        election.getAggregate();
+        assertEq(election.aggregateDigest(), bytes32(0));
 
-        // Second keyper submits the byte-identical aggregate → canonical.
-        vm.expectEmit(true, false, false, false, address(election));
-        emit IElection.AggregatePublished(1);
+        // Second keyper submits the byte-identical aggregate → canonical. Storage keeps the
+        // digest; the full artifact is in the event.
+        vm.expectEmit(true, false, false, true, address(election));
+        emit IElection.AggregatePublished(1, _digest(aggregate), abi.encode(aggregate));
         vm.prank(keyper2);
         election.submitAggregate(aggregate);
 
-        VotingTypes.EncryptedTally memory storedAggregate = election.getAggregate();
-        assertEq(storedAggregate.aggregates.length, 3);
-        assertEq(storedAggregate.aggregates[0].c1, aggregate.aggregates[0].c1);
-        assertEq(storedAggregate.aggregates[2].c2, aggregate.aggregates[2].c2);
+        assertEq(election.aggregateDigest(), _digest(aggregate));
     }
 
     function test_submitAggregateDivergentSubmissionsDoNotFinalize() external {
@@ -97,14 +94,12 @@ contract ElectionTallyTest is Test {
         vm.prank(keyper2);
         election.submitAggregate(_aggregate(71));
 
-        vm.expectRevert(ElectionBase.AggregateNotPublished.selector);
-        election.getAggregate();
+        assertEq(election.aggregateDigest(), bytes32(0));
 
         // The third keyper agreeing with keyper1 reaches quorum on that artifact.
         vm.prank(keyper3);
         election.submitAggregate(_aggregate(70));
-        VotingTypes.EncryptedTally memory storedAggregate = election.getAggregate();
-        assertEq(storedAggregate.aggregates[0].c1, _aggregate(70).aggregates[0].c1);
+        assertEq(election.aggregateDigest(), _digest(_aggregate(70)));
     }
 
     function test_submitAggregateRejectsUnauthorizedTimingAndBadPayload() external {
@@ -139,15 +134,14 @@ contract ElectionTallyTest is Test {
         election.submitAggregate(_aggregate(70));
         vm.prank(keyper2);
         election.submitAggregate(_aggregate(71));
-        vm.expectRevert(ElectionBase.AggregateNotPublished.selector);
-        election.getAggregate();
+        assertEq(election.aggregateDigest(), bytes32(0));
 
         // keyper2 realizes it was wrong and OVERRIDES to keyper1's aggregate → quorum.
-        vm.expectEmit(true, false, false, false, address(election));
-        emit IElection.AggregatePublished(1);
+        vm.expectEmit(true, false, false, true, address(election));
+        emit IElection.AggregatePublished(1, _digest(_aggregate(70)), abi.encode(_aggregate(70)));
         vm.prank(keyper2);
         election.submitAggregate(_aggregate(70));
-        assertEq(election.getAggregate().aggregates[0].c1, _aggregate(70).aggregates[0].c1);
+        assertEq(election.aggregateDigest(), _digest(_aggregate(70)));
 
         // Once finalized, further submissions (even overrides) are frozen out.
         vm.prank(keyper3);
@@ -383,6 +377,13 @@ contract ElectionTallyTest is Test {
         ballot.zkProof = abi.encodePacked(seed, seed + 1, seed + 2);
         ballot.voterSignature = abi.encodePacked(bytes32(uint256(seed + 100)));
         ballot.wrAttestation = abi.encodePacked(bytes32(uint256(seed + 200)));
+    }
+
+    /// @dev The digest keypers sign and the contract stores for the canonical aggregate.
+    function _digest(VotingTypes.EncryptedTally memory aggregate) private view returns (bytes32) {
+        return keccak256(
+            abi.encodePacked("SHUTTER-GOVERNANCE-PROTOCOL-AGGREGATE-v1", election.electionId(), abi.encode(aggregate))
+        );
     }
 
     function _aggregate(uint8 seed) private pure returns (VotingTypes.EncryptedTally memory aggregate) {

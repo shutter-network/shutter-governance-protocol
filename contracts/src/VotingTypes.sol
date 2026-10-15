@@ -22,7 +22,9 @@ library VotingTypes {
         uint8 variant;
         bool weighted;
         /// @notice Divisor applied to every attested weight at aggregation; 1 = none.
-        uint32 scale;
+        /// @dev uint256: token weights are often in wei, so a useful scale (e.g. 1e15) is
+        ///      far beyond uint32.
+        uint256 scale;
         uint8 duplicatePolicy;
         string protocolVersion;
         // forge-lint: disable-next-line(mixed-case-variable)
@@ -55,9 +57,23 @@ library VotingTypes {
         bytes wrAttestation;
     }
 
-    /// @notice Stored ballot metadata alongside the user payload.
+    /// @notice Stored form of a ballot. Identical to `Ballot` except that the proof is kept
+    ///         as its keccak256 commitment: the proof is most of a ballot's bytes (3 KB of
+    ///         ~4.4 KB for three candidates, ~78 KB at budget 100), and storage was what made
+    ///         casting and reading ballots too expensive. The full proof is in the
+    ///         `VoteSubmitted` event; readers fetch it from the log and check it against this.
+    struct BallotView {
+        bytes32 pseudonym;
+        bytes vk;
+        Ciphertext[] ciphertexts;
+        bytes32 zkProofHash;
+        bytes voterSignature;
+        bytes wrAttestation;
+    }
+
+    /// @notice Stored ballot metadata alongside the stored ballot.
     struct BallotRecord {
-        Ballot ballot;
+        BallotView ballot;
         uint64 submittedAt;
         address submittedBy;
     }
@@ -79,7 +95,9 @@ library VotingTypes {
         uint8 variant;
         bool weighted;
         /// @notice Divisor applied to every attested weight at aggregation; 1 = none.
-        uint32 scale;
+        /// @dev uint256: token weights are often in wei, so a useful scale (e.g. 1e15) is
+        ///      far beyond uint32.
+        uint256 scale;
         uint8 duplicatePolicy;
         string protocolVersion;
         uint64 thresholdN;

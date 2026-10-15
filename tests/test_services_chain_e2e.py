@@ -170,6 +170,12 @@ def test_full_weighted_election_over_chain(anvil_w3):
     fresh = BlockchainDataLayer(anvil_w3, world.registry, world.signers["admin"].account)
     assert list(fresh.get_result(ELECTION_ID).totals) == [6, 15, 0]
 
+    # An honest chain election audits clean. The chain read used to return every DKG vote
+    # with an empty signature and a copied committee, so the auditor found "no quorum".
+    from shutter_governance_protocol.services import auditor
+    report = auditor.audit(fresh, ELECTION_ID)
+    assert report.ok, report.discrepancies
+
 
 def test_tally_completes_despite_an_undecodable_ballot_on_chain(anvil_w3):
     """An outsider stores a ballot whose credential bytes are not a credential. Voting

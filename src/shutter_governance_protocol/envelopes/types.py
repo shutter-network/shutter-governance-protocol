@@ -161,6 +161,7 @@ class DKGResultSubmission:
     pk_election: bytes  # G2, 96 bytes — joint election public key
     committee_pks: tuple[bytes, ...]  # each G2, 96 bytes — per-keyper public shares
     keyper_signature: bytes  # signature by the submitting keyper's registered key
+    submitter: bytes | None = None
 
 
 @dataclass(frozen=True)

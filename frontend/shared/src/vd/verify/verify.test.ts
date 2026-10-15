@@ -44,6 +44,10 @@ describe("ballot verification (SDK 0.3)", () => {
     expect(await verifyBallotLocal(makeBallot([1n, 0n, 2n], 5n), cfg, mpkHex)).toEqual({ ok: true });
   });
 
+  it("accepts an honest ballot with a wei-scale weight (above 2^53)", async () => {
+    expect(await verifyBallotLocal(makeBallot([1n, 0n, 2n], 1234567890123456789n), cfg, mpkHex)).toEqual({ ok: true });
+  });
+
   it("rejects a ballot whose credential weight was edited", async () => {
     const b = makeBallot([3n, 0n, 0n], 1n);
     const res = await verifyBallotLocal({ ...b, attestation: { ...b.attestation!, weight: "9" } }, cfg, mpkHex);

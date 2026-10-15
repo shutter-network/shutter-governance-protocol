@@ -304,3 +304,26 @@ def test_dec_stored_ballot_never_raises():
     for bad in (None, {}, [], 7, "x", {"attestation": []}):
         envelope, reason = dec_stored_ballot(bad)
         assert envelope is None and reason
+
+
+# --------------------------------------------------------------------------- #
+#  One per voter: weight must be 1 in an unweighted election
+# --------------------------------------------------------------------------- #
+
+def test_unweighted_election_excludes_a_credential_above_weight_1(env):
+    """`weighted=False` used to be enforced only through a max_weight ceiling of 1; once
+    that ceiling was removed nothing read the flag, and a weight-79 credential counted 79
+    times in a one-per-voter election."""
+    cfg = env.config(weighted=False)
+    ballots = [_stored(env, 0, [3, 0, 0], P1, weight=79), _stored(env, 1, [0, 3, 0], P2, weight=1)]
+    res = admit(ballots, cfg, env.mpk_bytes)
+    assert [a.sequence_number for a in res.admitted] == [1]
+    assert [(x.sequence_number, x.reason) for x in res.exclusions] == [(0, ExclusionReason.INVALID_ATTESTATION)]
+    assert res.total_admitted_weight == 1
+
+
+def test_weighted_election_admits_any_signed_weight(env):
+    cfg = env.config(weighted=True)
+    ballots = [_stored(env, 0, [3, 0, 0], P1, weight=79), _stored(env, 1, [0, 3, 0], P2, weight=1)]
+    res = admit(ballots, cfg, env.mpk_bytes)
+    assert res.total_admitted_weight == 80 and res.exclusions == ()

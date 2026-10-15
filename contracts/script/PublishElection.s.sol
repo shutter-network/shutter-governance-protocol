@@ -49,7 +49,7 @@ contract PublishElection is Script {
             mode: _toUint8("MODE", vm.envOr("MODE", uint256(0))),
             variant: _toUint8("VARIANT", vm.envOr("VARIANT", uint256(0))),
             weighted: vm.envOr("WEIGHTED", false),
-            scale: _toUint32("SCALE", vm.envOr("SCALE", uint256(1))),
+            scale: vm.envOr("SCALE", uint256(1)),
             duplicatePolicy: _toUint8("DUPLICATE_POLICY", vm.envOr("DUPLICATE_POLICY", uint256(1))),
             protocolVersion: vm.envOr("PROTOCOL_VERSION", string("SHUTTER-VOTE-v1")),
             pkWR: vm.envBytes("PK_WR"),

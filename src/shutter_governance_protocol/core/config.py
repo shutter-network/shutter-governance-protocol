@@ -168,6 +168,8 @@ class ElectionConfig:
             raise ValueError("The budget must be at least 1.")
         if self.scale < 1:
             raise ValueError("Scale must be at least 1 (1 means no scaling).")
+        if self.scale >= 2**256:
+            raise ValueError("Scale must fit in 256 bits.")
         self._check_ballot_bounds()
         if self.voting_end <= self.voting_start:
             raise ValueError("Voting end must be after voting start.")

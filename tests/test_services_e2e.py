@@ -351,3 +351,49 @@ def test_check_result_rejects_a_totals_vector_of_the_wrong_length(full_env):
     ok, reason = check_result(cfg, aggregate, shares, pks, quorum, (1, 1))
     assert not ok
     assert reason.startswith("result:") and "2 totals published for 3 candidates" in reason
+
+
+def test_wei_scale_weights_survive_the_json_wire_and_tally_exactly(full_env):
+    """Token weights in wei (~1.2 tokens here) used to travel as JSON numbers, which a
+    browser rounds above 2^53, so the voter signed a different weight from the issuer's.
+    They now travel as decimal strings. A JSON round trip must preserve the weight
+    exactly, the ballot must be admitted, and the published artifacts must round-trip too."""
+    import json
+
+    from shutter_governance_protocol.envelopes import codecs
+
+    fe = full_env
+    fe.config = replace(fe.config, scale=10**15)  # tally in milli-tokens, as a token election would
+    _register_and_dkg(fe)
+    fe.clock.set(1500)
+    w1, w2 = 1_234_567_890_123_456_789, 25 * 10**21 + 7
+    for votes, pseudonym, w in (([3, 0, 0], b"\x01" * 32, w1), ([0, 3, 0], b"\x02" * 32, w2)):
+        wire = json.loads(json.dumps(codecs.enc_ballot(fe.voter_ballot(votes, pseudonym, weight=w))))
+        assert wire["attestation"]["weight"] == str(w)
+        submit_ballot(fe.dl, fe.config.election_id, codecs.dec_ballot(wire), clock=fe.clock, gateway_signer=fe.gateway)
+
+    fe.clock.set(2500)
+    result = agg.run_tally(fe.dl, fe.config.election_id, fe.result_publisher, fe.keypers, clock=fe.clock)
+    s1, s2 = (w1 + 5 * 10**14) // 10**15, (w2 + 5 * 10**14) // 10**15  # half-up scaled weights
+    assert list(result.totals) == [3 * s1, 3 * s2, 0]
+    aggregate = fe.dl.get_aggregate(fe.config.election_id)
+    assert aggregate.total_admitted_weight == w1 + w2
+    assert codecs.dec_aggregate(json.loads(json.dumps(codecs.enc_aggregate(aggregate)))) == aggregate
+    assert codecs.dec_result(json.loads(json.dumps(codecs.enc_result(result)))) == result
+
+
+def test_auditor_accepts_an_honest_scaled_election(full_env):
+    """The auditor's last check derived the search bound from the raw admitted weight, but
+    the tally searches budget × Σ(scaled weights). Every honest election with scale > 1
+    was reported as failing."""
+    fe = full_env
+    fe.config = replace(fe.config, scale=2)
+    _register_and_dkg(fe)
+    fe.clock.set(1_500)
+    submit_ballot(fe.dl, fe.config.election_id, fe.voter_ballot([3, 0, 0], b"\x01" * 32, weight=3), clock=fe.clock, gateway_signer=fe.gateway)
+    submit_ballot(fe.dl, fe.config.election_id, fe.voter_ballot([0, 3, 0], b"\x02" * 32, weight=5), clock=fe.clock, gateway_signer=fe.gateway)
+    fe.clock.set(2_500)
+    result = agg.run_tally(fe.dl, fe.config.election_id, fe.result_publisher, fe.keypers, clock=fe.clock)
+    assert result.bsgs_bound == 3 * (2 + 3)  # budget × (scaled 3→2 + scaled 5→3)
+    report = auditor.audit(fe.dl, fe.config.election_id)
+    assert report.ok, report.discrepancies

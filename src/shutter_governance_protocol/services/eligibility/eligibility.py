@@ -55,6 +55,9 @@ _LOG = logging.getLogger("shutter_governance_protocol.eligibility")
 # A nonce allocator returns the next monotonic re-vote counter for an (election, pseudonym):
 # 1 for a first vote, then 2, 3, … on each subsequent /attest for the same voter.
 NonceAllocator = Callable[[bytes, bytes], int]
+# Whether an election is weighted, read from its registered config. Per election: the same
+# voter may hold weight 79 in a weighted election and must get 1 in an unweighted one.
+WeightedLookup = Callable[[bytes], bool]
 
 
 def challenge_message(election_id: bytes, vk: bytes) -> str:
@@ -153,7 +156,8 @@ def _in_memory_nonce_allocator() -> NonceAllocator:
 
 def build_eligibility_app(service: StubEligibilityService, *, pseudonym_secret: bytes,
                           weight: int = 1, allowlist_path: str | None = None,
-                          next_nonce: NonceAllocator | None = None) -> Flask:
+                          next_nonce: NonceAllocator | None = None,
+                          weighted_for: WeightedLookup | None = None) -> Flask:
     """Build the wallet-authenticated eligibility HTTP app. ``pseudonym_secret`` keys the
     pseudonym; ``weight`` is the (dummy) default voting weight. If ``allowlist_path`` is
     given, that JSON file gates issuance (re-read per request): a listed wallet gets its
@@ -162,8 +166,12 @@ def build_eligibility_app(service: StubEligibilityService, *, pseudonym_secret: 
     per-(election, pseudonym) re-vote counter bound into each attestation; it defaults to an
     in-memory counter (fine for tests; ``main()`` supplies a durable SQLite store).
 
-    Weight is issued **as held**. This used to clamp to the election's ``max_weight``;
-    that ceiling is gone from the protocol, so there is nothing to clamp against."""
+    ``weighted_for(election_id) -> bool`` reads whether the target election is weighted.
+    For an unweighted (one per voter) election every credential is issued at weight 1,
+    because admission excludes any other weight there and the voter's ballot would be
+    lost. A weighted election gets the weight as held. ``main()`` reads it from the
+    registered config; when ``None`` the weight is issued as held (tests that need no
+    election)."""
     app = Flask(__name__)
     # Bound the body every route buffers via get_json(force=True).
     app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
@@ -221,6 +229,23 @@ def build_eligibility_app(service: StubEligibilityService, *, pseudonym_secret: 
                                message="This wallet isn't eligible for this election."), 403
             voter_weight = allow[addr_hex]
 
+        # One per voter: issue weight 1 for an unweighted election. Fails closed when the
+        # election cannot be read, because a guessed weight could be one the tally rejects.
+        if weighted_for is not None:
+            try:
+                weighted = bool(weighted_for(election_id))
+            except KeyError:
+                return jsonify(error="NotFound", message="Unknown election."), 404
+            except Exception as exc:  # noqa: BLE001
+                _LOG.error("op=attest status=error election=%s reason=config_unavailable err=%s",
+                           election_id.hex(), exc)
+                return jsonify(error="ServerError",
+                               message="Could not read the election's settings — try again shortly."), 503
+            if not weighted and voter_weight != 1:
+                _LOG.info("op=attest status=clamped election=%s addr=0x%s weight=%d reason=unweighted",
+                          election_id.hex(), addr_hex, voter_weight)
+                voter_weight = 1
+
         pseudonym = derive_pseudonym(pseudonym_secret, election_id, address)
         # Monotonic re-vote nonce for THIS (election, pseudonym): a first vote gets 1, each
         # re-vote a higher value. Bound into the attestation so the tally keeps the latest
@@ -245,6 +270,35 @@ def _pseudonym_secret(elig_sk_hex: str) -> bytes:
     return keccak(b"shutter-governance-protocol-pseudonym-v1" + int(elig_sk_hex, 16).to_bytes(32, "big"))
 
 
+def config_weighted_lookup(api_url: str) -> WeightedLookup:
+    """Resolve whether an election is weighted from its **registered config**, cached per id.
+
+    Reads go through the API's port surface (the one keypers use); the data-layer service is
+    internal-only. Caching is safe because the config is immutable once registered. An
+    unknown election raises ``KeyError``; any other failure propagates, so the caller fails
+    closed.
+    """
+    from shutter_governance_protocol.adapters.db.client import HttpDataLayerClient
+    from shutter_governance_protocol.services.data_layer.data_layer import PORT_READ_PREFIX
+
+    dl = HttpDataLayerClient(api_url.rstrip("/") + PORT_READ_PREFIX)
+    cache: dict[bytes, bool] = {}
+    lock = threading.Lock()
+
+    def lookup(election_id: bytes) -> bool:
+        key = bytes(election_id)
+        with lock:
+            hit = cache.get(key)
+        if hit is not None:
+            return hit
+        weighted = bool(dl.get_election(key).config.weighted)
+        with lock:
+            cache[key] = weighted
+        return weighted
+
+    return lookup
+
+
 def main() -> None:
     """Run the wallet-authenticated (dummy) eligibility service.
 
@@ -254,7 +308,9 @@ def main() -> None:
     ``ELIGIBILITY_ALLOWLIST`` (optional path to a JSON allowlist gating issuance; unset →
     allow all), ``ELIGIBILITY_NONCE_DB`` (SQLite path for the durable per-(election,
     pseudonym) re-vote counter; default ``eligibility-nonces.db`` — mount it on a volume so
-    re-votes survive restarts), ``ELIGIBILITY_HOST`` / ``ELIGIBILITY_PORT`` (default 8600).
+    re-votes survive restarts), ``ELIGIBILITY_HOST`` / ``ELIGIBILITY_PORT`` (default 8600),
+    ``SHUTTER_GOVERNANCE_PROTOCOL_API_URL`` (required: the public API's base URL, read for
+    each election's ``weighted`` setting).
     """
     logging.basicConfig(level=logging.INFO)
     elig_sk_hex = os.environ["ELIGIBILITY_PRIVATE_KEY"]
@@ -262,6 +318,11 @@ def main() -> None:
     port = int(os.environ.get("ELIGIBILITY_PORT", "8600"))
     allowlist_path = os.environ.get("ELIGIBILITY_ALLOWLIST") or None
     nonce_db = os.environ.get("ELIGIBILITY_NONCE_DB", "eligibility-nonces.db")
+    api_url = (os.environ.get("SHUTTER_GOVERNANCE_PROTOCOL_API_URL") or "").strip()
+    if not api_url:
+        raise SystemExit(
+            "set SHUTTER_GOVERNANCE_PROTOCOL_API_URL to the public API's base URL (e.g. "
+            "http://host.docker.internal:8500): the issuer reads each election's weighted setting")
     _LOG.info("op=start service=eligibility port=%d eligibility_key=%s auth=wallet-personal-sign policy=%s nonce_db=%s",
               port, codecs.enc_bytes(service.eligibility_key),
               f"allowlist:{allowlist_path}" if allowlist_path else "allow-all", nonce_db)
@@ -271,6 +332,7 @@ def main() -> None:
         weight=int(os.environ.get("ELIGIBILITY_DUMMY_WEIGHT", "1")),
         allowlist_path=allowlist_path,
         next_nonce=SqliteNonceStore(nonce_db).next,
+        weighted_for=config_weighted_lookup(api_url),
     )
     app.run(host=os.environ.get("ELIGIBILITY_HOST", "0.0.0.0"), port=port)
 

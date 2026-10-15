@@ -77,6 +77,11 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
         config.eligibility_key, att, election_id=config.election_id
     ):
         return ExclusionReason.INVALID_ATTESTATION
+    # One per voter: an unweighted election counts every ballot once, whatever weight the
+    # issuer signed. Excluded rather than counted at 1, so a misconfigured issuer shows up
+    # in the exclusions instead of being silently corrected.
+    if not config.weighted and att.weight != 1:
+        return ExclusionReason.INVALID_ATTESTATION
 
     # Ballot crypto: range/budget proofs + Schnorr signature.
     ok, reason = verify_ballot_crypto(

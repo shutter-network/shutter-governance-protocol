@@ -26,11 +26,6 @@ abstract contract ElectionTally is ElectionBase {
         _registerAggregate(signer, digest, aggregate);
     }
 
-    function getAggregate() external view returns (VotingTypes.EncryptedTally memory aggregate) {
-        if (!aggregatePublished) revert AggregateNotPublished();
-        return abi.decode(encryptedTallyEncoded, (VotingTypes.EncryptedTally));
-    }
-
     /// @dev Digest that both (a) the keyper signs and (b) groups byte-identical
     ///      submissions for the quorum count. Byte-identical for honest keypers.
     function _aggregateDigest(VotingTypes.EncryptedTally calldata aggregate) private view returns (bytes32) {
@@ -60,11 +55,11 @@ abstract contract ElectionTally is ElectionBase {
         emit AggregateVoteRegistered(voter, resultDigest);
 
         if (aggregateVoteCountByResult[resultDigest] >= keyperSet.getThreshold()) {
-            // Store the canonical aggregate (admitted set + exclusions + total weight
-            // included) as its encoded blob.
-            encryptedTallyEncoded = abi.encode(aggregate);
+            // Keep only the digest the keypers signed; publish the artifact (sums, admitted
+            // set, exclusions, weight totals) in the event for readers to check against it.
+            aggregateDigest = resultDigest;
             aggregatePublished = true;
-            emit AggregatePublished(electionId);
+            emit AggregatePublished(electionId, resultDigest, abi.encode(aggregate));
         }
     }
 

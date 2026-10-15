@@ -45,7 +45,7 @@ contract ElectionVoteTest is Test {
 
         vm.warp(votingStart);
         vm.expectEmit(true, true, false, true, address(election));
-        emit IElection.VoteSubmitted(ballot.pseudonym, 0);
+        emit IElection.VoteSubmitted(ballot.pseudonym, 0, ballot.zkProof); // the full proof is in the event
 
         vm.prank(voter);
         election.submitVote{value: selfSubmitFee}(ballot);
@@ -54,10 +54,10 @@ contract ElectionVoteTest is Test {
         assertEq(address(election).balance, selfSubmitFee);
 
         VotingTypes.BallotRecord[] memory records = election.getBallots(0, 1);
-        VotingTypes.Ballot memory storedBallot = records[0].ballot;
+        VotingTypes.BallotView memory storedBallot = records[0].ballot;
         assertEq(storedBallot.pseudonym, ballot.pseudonym);
         assertEq(storedBallot.vk, ballot.vk);
-        assertEq(storedBallot.zkProof, ballot.zkProof);
+        assertEq(storedBallot.zkProofHash, keccak256(ballot.zkProof)); // storage keeps only the commitment
         assertEq(storedBallot.voterSignature, ballot.voterSignature);
         assertEq(storedBallot.wrAttestation, ballot.wrAttestation);
         assertEq(storedBallot.ciphertexts.length, 3);

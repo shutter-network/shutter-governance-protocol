@@ -36,6 +36,7 @@ abstract contract ElectionDKG is ElectionBase {
     }
 
     function _registerDKGVote(address voter, bytes calldata pkElection, bytes[] calldata committeePKs) private {
+        if (block.timestamp >= votingStart) revert DKGClosed(block.timestamp);
         if (!keyperSet.isMember(voter)) revert UnauthorizedKeyper(voter);
         if (hasVotedForDKG[voter]) revert AlreadyVoted(voter);
 

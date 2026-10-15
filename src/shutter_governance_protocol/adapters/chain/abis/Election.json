@@ -64,8 +64,8 @@
           },
           {
             "name": "scale",
-            "type": "uint32",
-            "internalType": "uint32"
+            "type": "uint256",
+            "internalType": "uint256"
           },
           {
             "name": "duplicatePolicy",
@@ -159,6 +159,19 @@
   },
   {
     "type": "function",
+    "name": "aggregateDigest",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "budget",
     "inputs": [],
     "outputs": [
@@ -183,6 +196,19 @@
     "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "deployBlock",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -212,70 +238,6 @@
   },
   {
     "type": "function",
-    "name": "getAggregate",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "aggregate",
-        "type": "tuple",
-        "internalType": "struct VotingTypes.EncryptedTally",
-        "components": [
-          {
-            "name": "aggregates",
-            "type": "tuple[]",
-            "internalType": "struct VotingTypes.Ciphertext[]",
-            "components": [
-              {
-                "name": "c1",
-                "type": "bytes",
-                "internalType": "bytes"
-              },
-              {
-                "name": "c2",
-                "type": "bytes",
-                "internalType": "bytes"
-              }
-            ]
-          },
-          {
-            "name": "admitted",
-            "type": "uint256[]",
-            "internalType": "uint256[]"
-          },
-          {
-            "name": "exclusions",
-            "type": "tuple[]",
-            "internalType": "struct VotingTypes.Exclusion[]",
-            "components": [
-              {
-                "name": "sequenceNumber",
-                "type": "uint256",
-                "internalType": "uint256"
-              },
-              {
-                "name": "reason",
-                "type": "uint8",
-                "internalType": "uint8"
-              }
-            ]
-          },
-          {
-            "name": "totalAdmittedWeight",
-            "type": "uint256",
-            "internalType": "uint256"
-          },
-          {
-            "name": "totalScaledWeight",
-            "type": "uint256",
-            "internalType": "uint256"
-          }
-        ]
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "getBallot",
     "inputs": [
       {
@@ -293,7 +255,7 @@
           {
             "name": "ballot",
             "type": "tuple",
-            "internalType": "struct VotingTypes.Ballot",
+            "internalType": "struct VotingTypes.BallotView",
             "components": [
               {
                 "name": "pseudonym",
@@ -323,9 +285,9 @@
                 ]
               },
               {
-                "name": "zkProof",
-                "type": "bytes",
-                "internalType": "bytes"
+                "name": "zkProofHash",
+                "type": "bytes32",
+                "internalType": "bytes32"
               },
               {
                 "name": "voterSignature",
@@ -378,7 +340,7 @@
           {
             "name": "ballot",
             "type": "tuple",
-            "internalType": "struct VotingTypes.Ballot",
+            "internalType": "struct VotingTypes.BallotView",
             "components": [
               {
                 "name": "pseudonym",
@@ -408,9 +370,9 @@
                 ]
               },
               {
-                "name": "zkProof",
-                "type": "bytes",
-                "internalType": "bytes"
+                "name": "zkProofHash",
+                "type": "bytes32",
+                "internalType": "bytes32"
               },
               {
                 "name": "voterSignature",
@@ -543,8 +505,8 @@
           },
           {
             "name": "scale",
-            "type": "uint32",
-            "internalType": "uint32"
+            "type": "uint256",
+            "internalType": "uint256"
           },
           {
             "name": "duplicatePolicy",
@@ -894,8 +856,8 @@
     "outputs": [
       {
         "name": "",
-        "type": "uint32",
-        "internalType": "uint32"
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "stateMutability": "view"
@@ -1334,6 +1296,18 @@
         "type": "uint256",
         "indexed": true,
         "internalType": "uint256"
+      },
+      {
+        "name": "digest",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "tally",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
       }
     ],
     "anonymous": false
@@ -1562,6 +1536,12 @@
         "type": "uint256",
         "indexed": true,
         "internalType": "uint256"
+      },
+      {
+        "name": "zkProof",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
       }
     ],
     "anonymous": false
@@ -1621,6 +1601,17 @@
         "name": "pseudonym",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "DKGClosed",
+    "inputs": [
+      {
+        "name": "timestamp",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ]
   },

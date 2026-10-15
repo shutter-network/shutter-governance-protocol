@@ -147,6 +147,10 @@ class InMemoryDataLayer(ElectionDataLayer):
             ):
                 raise ImmutabilityError(f"keyper {idx} already submitted a different DKG result")
             return
+        # A new vote once voting has opened could finalize the key of an election that has
+        # already failed for lack of one (the chain contract refuses it too).
+        if self._clock() >= st.config.voting_start:
+            raise VotingWindowError("DKG vote submitted after voting_start")
         st.dkg_by_keyper[idx] = submission
 
     def get_dkg_submissions(self, election_id) -> list[DKGResultSubmission]:

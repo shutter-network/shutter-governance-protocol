@@ -8,9 +8,13 @@ import {VotingTypes} from "../VotingTypes.sol";
 interface IElection is IAccessControl {
     event DKGVoteRegistered(address indexed keyper, bytes pkElection);
     event DKGResultPublished(bytes pkElection, bytes[] committeePKs);
-    event VoteSubmitted(bytes32 indexed pseudonym, uint256 indexed ballotIndex);
+    /// @notice `zkProof` is the ballot's full proof; storage keeps only its keccak256.
+    event VoteSubmitted(bytes32 indexed pseudonym, uint256 indexed ballotIndex, bytes zkProof);
     event AggregateVoteRegistered(address indexed keyper, bytes32 resultDigest);
-    event AggregatePublished(uint256 indexed electionId);
+    /// @notice Emitted once, when the aggregate reaches the keyper quorum. `tally` is
+    ///         `abi.encode(EncryptedTally)`; storage keeps only `digest`, the hash the keypers
+    ///         signed, so readers check the event against `aggregateDigest()`.
+    event AggregatePublished(uint256 indexed electionId, bytes32 digest, bytes tally);
     event DecryptionSharePosted(uint8 indexed keyperIndex);
     event ResultPublished(uint256[] tally, uint8[] keyperIndices);
     event TallyStalledSet(bool stalled);
@@ -49,7 +53,10 @@ interface IElection is IAccessControl {
 
     function submitAggregate(VotingTypes.EncryptedTally calldata aggregate) external;
     function submitAggregateSigned(VotingTypes.EncryptedTally calldata aggregate, bytes calldata keyperSig) external;
-    function getAggregate() external view returns (VotingTypes.EncryptedTally memory encryptedTally);
+    /// @notice The canonical aggregate's digest, or zero until the quorum is reached.
+    function aggregateDigest() external view returns (bytes32);
+    /// @notice Block this election was created in: where readers start their log queries.
+    function deployBlock() external view returns (uint256);
 
     function submitDecryptionShare(bytes[] calldata shares, VotingTypes.DLEQProof[] calldata proofs) external;
     function submitDecryptionShareSigned(

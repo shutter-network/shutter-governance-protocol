@@ -14,11 +14,13 @@ import json
 import re
 from pathlib import Path
 
+from eth_abi import decode as eth_abi_decode
 from eth_utils import keccak
 from web3 import Web3
 
 from shutter_governance_protocol.core import write_auth
 from shutter_governance_protocol.adapters.chain import codec
+from shutter_governance_protocol.adapters.chain.tx import quorum_write_lock, send_and_confirm
 from shutter_governance_protocol.core.config import DuplicatePolicy, ElectionConfig, KeyperIdentity, Mode, Threshold, Variant
 from shutter_governance_protocol.envelopes.types import (
     AggregateArtifact,
@@ -67,7 +69,28 @@ _VOTING_WINDOW_SELECTORS = {
     _selector("VotingClosed(uint256)"),      # ballot after voting_end
     _selector("VotingStillOpen(uint256)"),   # tally write (aggregate/share/result) before voting_end
     _selector("AggregateNotPublished()"),    # decryption share before a canonical aggregate exists
+    _selector("DKGClosed(uint256)"),         # DKG vote once voting has opened
 }
+
+
+# Ballots per getBallots call. Returning a ballot from contract storage costs gas in the
+# eth_call: about 128k for a three-candidate ballot (the proof is in the VoteSubmitted log,
+# not storage), so a 50-ballot chunk is ~6.5M. Nodes cap a call at the block gas limit or
+# lower, and each candidate adds ~13k per ballot; list_ballots halves the chunk when a
+# call runs out.
+_BALLOT_READ_CHUNK = 50
+
+
+def _is_out_of_gas(exc: Exception) -> bool:
+    # Nodes word it differently: "EVM error OutOfGas" from eth_call, "Out of gas: gas
+    # required exceeds allowance" from estimation, "out of gas" elsewhere.
+    msg = str(exc).lower().replace(" ", "").replace("_", "")
+    return "outofgas" in msg or "gasrequiredexceeds" in msg
+
+
+# abi.encode(VotingTypes.EncryptedTally): (aggregates[(c1,c2)], admitted[], exclusions[(seq,reason)],
+# totalAdmittedWeight, totalScaledWeight), as emitted in AggregatePublished.
+_ENCRYPTED_TALLY_TYPE = "((bytes,bytes)[],uint256[],(uint256,uint8)[],uint256,uint256)"
 
 
 def _abi(name: str):
@@ -97,24 +120,14 @@ class BlockchainDataLayer(ElectionDataLayer):
             gas = fn.estimate_gas({"from": acct.address})
         except Exception as exc:  # noqa: BLE001 — revert surfaces here (pre-flight)
             raise self._map_revert(exc) from exc
-        tx = fn.build_transaction({
-            "from": acct.address,
-            "nonce": self.w3.eth.get_transaction_count(acct.address),
-            "gas": int(gas * 12 // 10),
-            "gasPrice": self.w3.eth.gas_price,
-        })
-        signed = acct.sign_transaction(tx)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
-        if receipt.status != 1:
-            raise RuntimeError("transaction reverted on chain")
-        return receipt
+        return send_and_confirm(self.w3, acct, fn, gas=gas * 12 // 10)
 
     @staticmethod
     def _map_revert(exc: Exception) -> Exception:
         msg = str(exc)
         # Decoded error names (when the ABI carried the error def).
-        if any(s in msg for s in ("VotingNotStarted", "VotingClosed", "VotingStillOpen", "AggregateNotPublished")):
+        if any(s in msg for s in ("VotingNotStarted", "VotingClosed", "VotingStillOpen", "AggregateNotPublished",
+                                  "DKGClosed")):
             return VotingWindowError(msg)
         if any(s in msg for s in ("AlreadyCancelled", "VotingAlreadyStarted", "AlreadyVoted", "AlreadyFinalized", "ElectionIdTaken")):
             return ImmutabilityError(msg)
@@ -130,6 +143,30 @@ class BlockchainDataLayer(ElectionDataLayer):
         if selectors & _AUTHZ_SELECTORS:
             return WriteAuthorizationError(msg)
         return ValueError(msg)
+
+    def _from_block(self, election) -> int:
+        """Where this election's log queries start: the block it was created in.
+
+        Proofs, DKG votes and the aggregate are read from event logs. Querying from
+        genesis is refused or times out on most public RPC providers.
+        """
+        cache = self.__dict__.setdefault("_deploy_blocks", {})
+        addr = election.address
+        if addr not in cache:
+            cache[addr] = int(election.functions.deployBlock().call())
+        return cache[addr]
+
+    def _ballot_proofs(self, election, start: int, count: int) -> dict[int, bytes]:
+        """``ballotIndex -> zkProof`` from the ``VoteSubmitted`` logs of ballots
+        ``start .. start+count-1``: one query, filtered on the indexed ``ballotIndex``."""
+        logs = election.events.VoteSubmitted().get_logs(
+            from_block=self._from_block(election),
+            argument_filters={"ballotIndex": list(range(start, start + count))},
+        )
+        out: dict[int, bytes] = {}
+        for log in logs:
+            out.setdefault(int(log["args"]["ballotIndex"]), bytes(log["args"]["zkProof"]))
+        return out
 
     def _election(self, election_id: bytes):
         addr = self.registry.functions.elections(codec.eid_to_uint(election_id)).call()
@@ -164,8 +201,14 @@ class BlockchainDataLayer(ElectionDataLayer):
         # straight pass-through — the old `+1` (and the matching `-1` on read) existed
         # only because the two sides disagreed on what `t` meant.
         quorum = config.threshold.quorum
-        ks = self._deploy(KEYPERSET_ABI, "KeyperSet", members, urls, quorum)
         params = self._config_to_params(config)
+        # Encode the publish call before the KeyperSet deploy: a config the contract
+        # types cannot hold must fail here, not after the admin has paid for a KeyperSet.
+        try:
+            self.registry.functions.publishElection(Web3.to_checksum_address("0x" + "00" * 20), params)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"register: config does not fit the election contract: {exc}") from exc
+        ks = self._deploy(KEYPERSET_ABI, "KeyperSet", members, urls, quorum)
         # The registry assigns the next sequential id; read it back from the event.
         # The receipt also carries the KeyperSet/Election deploy + role-grant logs, so
         # DISCARD non-matching ones instead of warning on each.
@@ -223,36 +266,46 @@ class BlockchainDataLayer(ElectionDataLayer):
         keyper_addr = Web3.to_checksum_address(
             write_auth.recover_digest(write_auth.dkg_result_digest(election_id, pk, committee), keyper_sig)
         )
-        if election.functions.isDKGFinalized().call():
-            _, dkg_raw = election.functions.getElection().call()
-            if bytes(dkg_raw[0]) == pk:
-                return
-            raise ImmutabilityError("DKG already finalized with a different key")
-        # Emulate append-only-per-dealer: inspect this keyper's prior vote via events.
-        mine = [
-            ev for ev in election.events.DKGVoteRegistered().get_logs(from_block=0)
-            if ev["args"]["keyper"] == keyper_addr
-        ]
-        if mine:
-            if bytes(mine[-1]["args"]["pkElection"]) == pk:
-                return  # identical resend → no-op
-            raise ImmutabilityError("keyper already submitted a different DKG result")
-        self._send(election.functions.voteDKGResultSigned(pk, committee, keyper_sig))
+        with quorum_write_lock(election.address):  # see tx.quorum_write_lock
+            if election.functions.isDKGFinalized().call():
+                _, dkg_raw = election.functions.getElection().call()
+                if bytes(dkg_raw[0]) == pk:
+                    return
+                raise ImmutabilityError("DKG already finalized with a different key")
+            # Emulate append-only-per-dealer: inspect this keyper's prior vote via events.
+            mine = [
+                ev for ev in election.events.DKGVoteRegistered().get_logs(from_block=self._from_block(election))
+                if ev["args"]["keyper"] == keyper_addr
+            ]
+            if mine:
+                if bytes(mine[-1]["args"]["pkElection"]) == pk:
+                    return  # identical resend → no-op
+                raise ImmutabilityError("keyper already submitted a different DKG result")
+            self._send(election.functions.voteDKGResultSigned(pk, committee, keyper_sig))
 
     def get_dkg_submissions(self, election_id) -> list[DKGResultSubmission]:
+        """Every DKG vote, rebuilt from the transaction that cast it.
+
+        The vote event carries only the voter and the public key, but the transaction's
+        input holds the whole vote: ``voteDKGResultSigned(pkElection, committeePKs,
+        keyperSig)`` for a relayed keyper vote, or ``voteDKGResult(pkElection,
+        committeePKs)`` sent by the keyper itself. Returning what each keyper actually
+        voted, with its own signature, lets an auditor recount the quorum exactly as on
+        the other backends. A vote without a signature carries ``submitter``, the
+        address the contract authenticated as its sender.
+        """
         election = self._election(election_id)
-        finalized = election.functions.isDKGFinalized().call()
-        committee = []
-        if finalized:
-            _, dkg_raw = election.functions.getElection().call()
-            committee = [bytes(p) for p in dkg_raw[1]]
         out = []
-        for ev in election.events.DKGVoteRegistered().get_logs(from_block=0):
+        for ev in election.events.DKGVoteRegistered().get_logs(from_block=self._from_block(election)):
+            tx = self.w3.eth.get_transaction(ev["transactionHash"])
+            fn, args = election.decode_function_input(tx["input"])
+            signature = bytes(args["keyperSig"]) if fn.fn_name == "voteDKGResultSigned" else b""
             out.append(DKGResultSubmission(
                 election_id=election_id,
-                pk_election=bytes(ev["args"]["pkElection"]),
-                committee_pks=tuple(committee),  # populated once finalized; empty otherwise
-                keyper_signature=b"",  # authz is tx-sender on chain
+                pk_election=bytes(args["pkElection"]),
+                committee_pks=tuple(bytes(p) for p in args["committeePKs"]),
+                keyper_signature=signature,
+                submitter=None if signature else _addr_bytes(ev["args"]["keyper"]),
             ))
         return out
 
@@ -282,11 +335,22 @@ class BlockchainDataLayer(ElectionDataLayer):
             return []
         # getBallots returns BallotRecord[] (payload + block-time submittedAt), so the
         # window check has an authoritative receive time. Ballot index == sequence number.
-        raw = election.functions.getBallots(start, count).call()
-        return [
-            codec.ballot_record_from_contract(rec, election_id, start + offset)
-            for offset, rec in enumerate(raw)
-        ]
+        out: list[StoredBallot] = []
+        at, chunk = start, min(count, _BALLOT_READ_CHUNK)
+        while at < start + count:
+            k = min(chunk, start + count - at)
+            try:
+                raw = election.functions.getBallots(at, k).call()
+            except Exception as exc:  # noqa: BLE001
+                if k == 1 or not _is_out_of_gas(exc):
+                    raise
+                chunk = max(1, k // 2)  # larger ballots than the chunk was sized for
+                continue
+            proofs = self._ballot_proofs(election, at, k)
+            out.extend(codec.ballot_record_from_contract(rec, election_id, at + offset, proofs.get(at + offset))
+                       for offset, rec in enumerate(raw))
+            at += k
+        return out
 
     def count_ballots(self, election_id) -> int:
         return int(self._election(election_id).functions.getNumBallots().call())
@@ -302,31 +366,43 @@ class BlockchainDataLayer(ElectionDataLayer):
         keyper_addr = Web3.to_checksum_address(write_auth.recover_digest(digest, keyper_sig))
         # If the aggregate is already canonical (t+1 quorum on chain), it is frozen:
         # a matching resend is a no-op; anything else can no longer become canonical.
-        existing = self._read_aggregate(election, election_id)
-        if existing is not None:
-            if existing == aggregate:
-                return
-            raise ImmutabilityError("aggregate already finalized with a different artifact")
-        # Not finalized: submissions are mutable per keyper (override allowed). Skip the
-        # tx only if this keyper's current on-chain vote already equals this digest.
-        mine = [
-            ev for ev in election.events.AggregateVoteRegistered().get_logs(from_block=0)
-            if ev["args"]["keyper"] == keyper_addr
-        ]
-        if mine and bytes(mine[-1]["args"]["resultDigest"]) == digest:
-            return  # this keyper's current vote is already this aggregate → no-op
-        self._send(election.functions.submitAggregateSigned(codec.aggregate_to_tuple(aggregate), keyper_sig))
+        with quorum_write_lock(election.address):  # see tx.quorum_write_lock
+            existing = self._read_aggregate(election, election_id)
+            if existing is not None:
+                if existing == aggregate:
+                    return
+                raise ImmutabilityError("aggregate already finalized with a different artifact")
+            # Not finalized: submissions are mutable per keyper (override allowed). Skip the
+            # tx only if this keyper's current on-chain vote already equals this digest.
+            mine = [
+                ev for ev in election.events.AggregateVoteRegistered().get_logs(from_block=self._from_block(election))
+                if ev["args"]["keyper"] == keyper_addr
+            ]
+            if mine and bytes(mine[-1]["args"]["resultDigest"]) == digest:
+                return  # this keyper's current vote is already this aggregate → no-op
+            self._send(election.functions.submitAggregateSigned(codec.aggregate_to_tuple(aggregate), keyper_sig))
 
     def get_aggregate(self, election_id) -> AggregateArtifact | None:
         return self._read_aggregate(self._election(election_id), election_id)
 
-    @staticmethod
-    def _read_aggregate(election, election_id):
-        try:
-            raw = election.functions.getAggregate().call()
-        except Exception:  # noqa: BLE001 — AggregateNotPublished
+    def _read_aggregate(self, election, election_id):
+        """The canonical aggregate, or ``None`` before the quorum.
+
+        Storage holds only the digest the keypers signed; the artifact is in the
+        ``AggregatePublished`` event. It is returned only if it hashes to that digest, so
+        a node serving a different event cannot substitute a different aggregate.
+        """
+        digest = bytes(election.functions.aggregateDigest().call())
+        if digest == bytes(32):
             return None
-        return codec.aggregate_from_contract(raw, election_id)
+        for log in election.events.AggregatePublished().get_logs(from_block=self._from_block(election)):
+            if bytes(log["args"]["digest"]) != digest:
+                continue
+            raw = eth_abi_decode([_ENCRYPTED_TALLY_TYPE], bytes(log["args"]["tally"]))[0]
+            artifact = codec.aggregate_from_contract(raw, election_id)
+            if write_auth.aggregate_digest_of(election_id, artifact) == digest:
+                return artifact
+        raise ValueError(f"election {election_id.hex()}: no AggregatePublished event matches the stored digest")
 
     def submit_decryption_share(self, election_id, share: DecryptionShareEnvelope, keyper_sig) -> None:
         election = self._election(election_id)
