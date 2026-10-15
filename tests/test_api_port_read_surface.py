@@ -139,6 +139,37 @@ def test_port_surface_caps_a_single_page_but_paging_recovers_everything(env):
     assert [sb.sequence_number for sb in everything] == list(range(total))
 
 
+def test_ballot_page_is_bounded_by_size_too(env, monkeypatch):
+    """1,000 rows of large ballots made one page hundreds of MB (1.3 GB at the form's
+    branch limit), slower than the client's 10 s timeout, so keyper reads failed and the
+    tally stalled. A page now also stops at a byte budget; readers page on what came back."""
+    import json
+
+    import requests
+
+    from shutter_governance_protocol.services.common.reads import read_all_ballots
+    from shutter_governance_protocol.services.data_layer import data_layer
+
+    dl, eid, base, _ = env
+    total = 250
+    for i in range(total):
+        dl.submit_ballot(eid, _ballot(eid, i))
+    one_row = len(requests.get(f"{base}/port/elections/{eid.hex()}/ballots?start=0&count=1").text)
+    monkeypatch.setattr(data_layer, "MAX_BALLOT_PAGE_BYTES", one_row * 7)
+
+    raw = requests.get(f"{base}/port/elections/{eid.hex()}/ballots?start=0&count=1000")
+    page = json.loads(raw.text)["ballots"]
+    assert 1 <= len(page) <= 8 and len(raw.content) < one_row * 9
+    assert [r["sequenceNumber"] for r in page] == list(range(len(page)))
+
+    everything = read_all_ballots(HttpDataLayerClient(f"{base}/port"), eid)
+    assert [sb.sequence_number for sb in everything] == list(range(total))
+
+    # A single ballot bigger than the whole budget is still served: a page never comes back empty.
+    monkeypatch.setattr(data_layer, "MAX_BALLOT_PAGE_BYTES", 1)
+    assert len(requests.get(f"{base}/port/elections/{eid.hex()}/ballots?start=5&count=50").json()["ballots"]) == 1
+
+
 def test_read_all_ballots_raises_rather_than_returning_short(env):
     """A truncated read must fail loudly. Silently returning fewer ballots is the failure
     that makes keypers diverge, and it would look like 'the committee disagreed'."""

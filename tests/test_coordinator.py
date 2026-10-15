@@ -209,6 +209,48 @@ def test_stall_survives_restart_and_resumes_only_on_admin_clear(kw, monkeypatch)
     assert w2.scan_once()[eid.hex()] == "collecting_aggregate"  # resumed, retrying
 
 
+def test_failed_stall_mark_is_retried_not_mistaken_for_an_admin_retry(kw, monkeypatch):
+    """If writing the stalled flag fails, the abandon is still owed. It used to read the
+    exhausted counter on a still-Tallying election as "the admin cleared it", reset the
+    budget and re-drive the keypers, forever, without the admin ever seeing TallyStalled."""
+    from shutter_governance_protocol.services.coordinator import dkg_coordinator as coord
+
+    eid = kw.register(voting_start=1000, voting_end=2000)
+    watcher = kw.watcher()
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    kw.clock.set(2500)
+    triggers = []
+    monkeypatch.setattr(coord, "trigger_aggregate_http",
+                        lambda *a, **k: (triggers.append(1), {1: "failed", 2: "failed", 3: "failed"})[1])
+    real_mark, fails = kw.dl.set_tally_stalled, [2]
+
+    def flaky_mark(eid_, stalled, *a, **k):
+        if stalled and fails[0] > 0:
+            fails[0] -= 1
+            raise ConnectionError("data layer unreachable")
+        return real_mark(eid_, stalled, *a, **k)
+    monkeypatch.setattr(kw.dl, "set_tally_stalled", flaky_mark)
+
+    outs = [watcher.scan_once()[eid.hex()] for _ in range(watcher.max_tally_attempts)]
+    assert outs[-1] == "tally_abandoned" and kw.dl.get_election(eid).tally_stalled is False  # mark failed
+    n = len(triggers)
+    assert watcher.scan_once()[eid.hex()] == "tally_abandoned"   # retries the mark only (fails again)
+    assert watcher.scan_once()[eid.hex()] == "tally_abandoned"   # retries the mark only (lands)
+    assert len(triggers) == n                                    # keypers were not re-driven
+    assert kw.dl.get_election(eid).tally_stalled is True
+    assert watcher.scan_once()[eid.hex()] == "tally_stalled"
+
+    # The admin's clear is a real retry: a fresh budget of max_tally_attempts.
+    kw.dl.set_tally_stalled(
+        eid, False,
+        kw.admin.sign("tally_resume", eid, authz.request_nonce_payload(int(kw.clock()))),
+        int(kw.clock()))
+    kw.clock.set(2600)  # a stall signature is single-use per timestamp; time moves on
+    outs = [watcher.scan_once()[eid.hex()] for _ in range(watcher.max_tally_attempts)]
+    assert outs[:-1] == ["collecting_aggregate"] * (watcher.max_tally_attempts - 1)
+    assert outs[-1] == "tally_abandoned" and kw.dl.get_election(eid).tally_stalled is True
+
+
 def test_watcher_abandons_tally_when_decryption_never_finalizes(kw, monkeypatch):
     """A canonical aggregate forms but decryption shares never reach t+1 → the decrypt
     phase is also bounded by max_tally_attempts, then abandoned."""

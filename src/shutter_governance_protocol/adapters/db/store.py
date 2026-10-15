@@ -174,7 +174,7 @@ class PostgresStore(ElectionDataLayer):
             config = self._config(conn, election_id)
             committee = [bytes(p) for p in committee_pks]
             digest = write_auth.dkg_result_digest(election_id, bytes(pk_election), committee)
-            idx = self._keyper_index_by_recovery(config, digest, keyper_sig)
+            idx = authz.keyper_index_by_recovery(config, digest, keyper_sig)
             submission = DKGResultSubmission(
                 election_id=election_id,
                 pk_election=bytes(pk_election),
@@ -326,7 +326,7 @@ class PostgresStore(ElectionDataLayer):
             if self._clock() < config.voting_end:
                 raise VotingWindowError("aggregate submitted before voting_end")
             digest = write_auth.aggregate_digest_of(election_id, aggregate)
-            idx = self._keyper_index_by_recovery(config, digest, keyper_sig)
+            idx = authz.keyper_index_by_recovery(config, digest, keyper_sig)
             # Lock the election row to serialize concurrent submissions (the finalize
             # check + override must be atomic — otherwise two overrides could race the
             # quorum). Mirrors submit_ballot's serialization.
@@ -388,7 +388,7 @@ class PostgresStore(ElectionDataLayer):
             shares = [e.sigma for e in share.entries]
             proofs = [(int.from_bytes(e.proof[:32], "big"), int.from_bytes(e.proof[32:], "big")) for e in share.entries]
             digest = write_auth.decryption_share_digest(election_id, shares, proofs)
-            idx = self._keyper_index_by_recovery(config, digest, keyper_sig)
+            idx = authz.keyper_index_by_recovery(config, digest, keyper_sig)
             if idx != share.keyper_index:
                 raise WriteAuthorizationError(
                     f"share keyper_index {share.keyper_index} does not match signer {idx}"
@@ -482,15 +482,3 @@ class PostgresStore(ElectionDataLayer):
 
     def verifiability_tier(self) -> int:
         return 0
-
-    # -- helpers ------------------------------------------------------------ #
-
-    def _keyper_index_by_recovery(self, config: ElectionConfig, digest: bytes, sig: bytes) -> int:
-        try:
-            recovered = write_auth.recover_digest(digest, sig)
-        except Exception as exc:  # noqa: BLE001
-            raise WriteAuthorizationError("bad keyper signature") from exc
-        for i, k in enumerate(config.keypers, start=1):
-            if k.signing_key == recovered:
-                return i
-        raise WriteAuthorizationError("signature matches no registered keyper")

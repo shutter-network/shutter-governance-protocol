@@ -70,17 +70,6 @@ class InMemoryDataLayer(ElectionDataLayer):
             raise KeyError(f"unknown election {election_id.hex()}")
         return st
 
-    def _keyper_index_by_recovery(self, config: ElectionConfig, digest: bytes, sig: bytes) -> int:
-        """Recover the keyper from a content signature; return its 1-based index."""
-        try:
-            recovered = write_auth.recover_digest(digest, sig)
-        except Exception as exc:  # noqa: BLE001
-            raise WriteAuthorizationError("bad keyper signature") from exc
-        for i, k in enumerate(config.keypers, start=1):
-            if k.signing_key == recovered:
-                return i
-        raise WriteAuthorizationError("signature matches no registered keyper")
-
     # -- election lifecycle ------------------------------------------------- #
 
     def register_election(self, config: ElectionConfig, admin_sig: bytes) -> bytes:
@@ -130,7 +119,7 @@ class InMemoryDataLayer(ElectionDataLayer):
         st = self._get(election_id)
         committee = [bytes(p) for p in committee_pks]
         digest = write_auth.dkg_result_digest(election_id, bytes(pk_election), committee)
-        idx = self._keyper_index_by_recovery(st.config, digest, keyper_sig)
+        idx = authz.keyper_index_by_recovery(st.config, digest, keyper_sig)
         submission = DKGResultSubmission(
             election_id=election_id,
             pk_election=bytes(pk_election),
@@ -238,7 +227,7 @@ class InMemoryDataLayer(ElectionDataLayer):
         if self._clock() < st.config.voting_end:
             raise VotingWindowError("aggregate submitted before voting_end")
         digest = write_auth.aggregate_digest_of(election_id, aggregate)
-        idx = self._keyper_index_by_recovery(st.config, digest, keyper_sig)
+        idx = authz.keyper_index_by_recovery(st.config, digest, keyper_sig)
         existing = st.aggregate_by_keyper.get(idx)
         if existing is not None and existing == aggregate:
             return  # idempotent resend of this keyper's current submission
@@ -282,7 +271,7 @@ class InMemoryDataLayer(ElectionDataLayer):
         shares = [e.sigma for e in share.entries]
         proofs = [(int.from_bytes(e.proof[:32], "big"), int.from_bytes(e.proof[32:], "big")) for e in share.entries]
         digest = write_auth.decryption_share_digest(election_id, shares, proofs)
-        idx = self._keyper_index_by_recovery(st.config, digest, keyper_sig)
+        idx = authz.keyper_index_by_recovery(st.config, digest, keyper_sig)
         if idx != share.keyper_index:
             raise WriteAuthorizationError(
                 f"share keyper_index {share.keyper_index} does not match signer {idx}"

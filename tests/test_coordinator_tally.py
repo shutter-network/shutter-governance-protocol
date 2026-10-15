@@ -42,19 +42,37 @@ class World:
         self.elig = StubEligibilityService(elig_sk)
         self._servers = []
         self.urls = {}
+        self.tmp_path = tmp_path
         for i in range(1, N + 1):
-            # Keypers trust only the coordinator to bootstrap them (sole bootstrapper).
-            app = build_keyper_app(self.keyper_signers[i - 1], self.dl,
-                                   self.coordinator.identity,
-                                   clock=self.clock, state_dir=tmp_path / f"k{i}")
-            srv = make_server("127.0.0.1", 0, app, threaded=True)
-            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            srv = self._serve(i, 0)
             self._servers.append(srv)
             self.urls[i] = f"http://127.0.0.1:{srv.server_port}"
+
+    def _serve(self, i: int, port: int):
+        # Keypers trust only the coordinator to bootstrap them (sole bootstrapper).
+        app = build_keyper_app(self.keyper_signers[i - 1], self.dl,
+                               self.coordinator.identity,
+                               clock=self.clock, state_dir=self.tmp_path / f"k{i}")
+        srv = make_server("127.0.0.1", port, app, threaded=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
 
     def shutdown(self):
         for s in self._servers:
             s.shutdown()
+
+    def stop(self, i: int) -> None:
+        """Take keyper ``i`` offline: its port refuses connections from now on."""
+        self._servers[i - 1].shutdown()
+        self._servers[i - 1].server_close()
+
+    def restart_without_tokens(self, i: int) -> None:
+        """Restart keyper ``i`` on the same URL after its saved tokens were lost. Its key
+        share and encryption key stay, so only the coordinator's token is missing."""
+        port = self._servers[i - 1].server_port
+        self.stop(i)
+        (self.tmp_path / f"k{i}" / "bootstrap_tokens.enc").unlink()
+        self._servers[i - 1] = self._serve(i, port)
 
     def register(self, *, voting_start=1000, voting_end=2000) -> bytes:
         cfg = ElectionConfig(
@@ -253,3 +271,61 @@ def test_tally_completes_after_a_withholding_dealer_is_excluded(world):
         assert watcher.scan_once()[eid.hex()] == "finalized"
     assert _run_to_tally(w, eid, watcher) == [6, 15, 0]
     assert _shares_that_verify(w, eid) == {s.keyper_index for s in w.dl.list_decryption_shares(eid)}
+
+
+def test_tally_completes_when_the_coordinator_lost_its_tokens_and_a_keyper_is_down(world):
+    """A coordinator with no saved tokens (restarted, state lost) has to bootstrap the
+    committee again at tally time. With one of three keypers down, the other two are still
+    a quorum. The bootstrap used to require every keyper to answer, so the tally failed on
+    every poll, before the attempt counter, and was never even marked stalled."""
+    w = world
+    eid = w.register()
+    assert AutoDKG(w.dl, w.coordinator, clock=w.clock).scan_once()[eid.hex()] == "finalized"
+    w.stop(3)
+    restarted = AutoDKG(w.dl, w.coordinator, clock=w.clock)  # no token store, nothing cached
+    assert _run_to_tally(w, eid, restarted) == [6, 15, 0]
+
+
+def test_tally_completes_when_a_keyper_needs_its_token_again_while_another_is_down(world, tmp_path):
+    """Keyper 1 no longer accepts the coordinator's token (401) while keyper 3 is down.
+    Re-installing keyper 1's token needs only keyper 1; it used to fetch every keyper's
+    status first and fail on keyper 3, leaving keyper 2 alone, short of a quorum."""
+    from shutter_governance_protocol.services.common.token_store import TokenStore
+
+    w = world
+    eid = w.register()
+    store = TokenStore(tmp_path / "coord-state", 0x1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF)
+    watcher = AutoDKG(w.dl, w.coordinator, clock=w.clock, token_store=store)
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    w.stop(3)
+    # The coordinator now presents a token keyper 1 does not hold, so keyper 1 answers 401.
+    store.put(w.urls[1], "re-minted-api", "re-minted-peer")
+    for tokens in watcher._tokens_by_committee.values():
+        tokens[1] = "re-minted-api"
+    assert _run_to_tally(w, eid, watcher) == [6, 15, 0]
+
+
+def test_dkg_still_needs_every_keyper_to_answer(world):
+    """Dealers seal a share to every member, so the DKG bootstrap stays strict: with a
+    keyper down it does not start, and the election is retried next poll."""
+    w = world
+    eid = w.register()
+    w.stop(3)
+    assert AutoDKG(w.dl, w.coordinator, clock=w.clock).scan_once()[eid.hex()] == "registered_retry"
+    assert w.dl.get_finalized_key(eid) is None
+
+
+def test_tally_completes_when_a_keyper_lost_its_saved_tokens_while_another_is_down(world, tmp_path):
+    """Keyper 2 restarts without its saved tokens while keyper 3 is down. It answers 503
+    "keyper not bootstrapped", not 401, and only a 401 used to re-install the token, so
+    keyper 1 was left alone, short of a quorum, and the tally stalled."""
+    from shutter_governance_protocol.services.common.token_store import TokenStore
+
+    w = world
+    eid = w.register()
+    store = TokenStore(tmp_path / "coord-state", 0x1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF)
+    watcher = AutoDKG(w.dl, w.coordinator, clock=w.clock, token_store=store)
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    w.stop(3)
+    w.restart_without_tokens(2)
+    assert _run_to_tally(w, eid, watcher) == [6, 15, 0]

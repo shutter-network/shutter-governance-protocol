@@ -30,11 +30,15 @@ from shutter_governance_protocol.envelopes import codecs
 from shutter_governance_protocol.ports.data_layer import (
     ElectionDataLayer,
     ElectionFilter,
-    FinalizedKey,
     QuorumConflictError,
     VotingWindowError,
 )
-from shutter_governance_protocol.services.data_layer.data_layer import MAX_CONTENT_LENGTH, PORT_READ_PREFIX, port_read_blueprint
+from shutter_governance_protocol.services.data_layer.data_layer import (
+    MAX_CONTENT_LENGTH,
+    PORT_READ_PREFIX,
+    _finalized_key_json,
+    port_read_blueprint,
+)
 from shutter_governance_protocol.services.gateway.gateway import GatewayRejection, submit_ballot
 
 _DEFAULT_LIMIT = 50
@@ -103,15 +107,6 @@ def _decimalize_election_ids(obj):
     if isinstance(obj, list):
         return [_decimalize_election_ids(x) for x in obj]
     return obj
-
-
-def _finalized_key_json(fk: FinalizedKey | None):
-    if fk is None:
-        return None
-    return {
-        "pkElection": codecs.enc_bytes(fk.pk_election),
-        "committeePKs": [codecs.enc_bytes(p) for p in fk.committee_pks],
-    }
 
 
 def build_api_app(

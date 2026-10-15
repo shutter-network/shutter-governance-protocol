@@ -230,7 +230,7 @@ Layered top-to-bottom so imports flow downward:
 - **`crypto/`** — the BLS12-381 suite (ElGamal-G2, Schnorr-G1, DLEQ/OR/budget
   proofs, Feldman DKG, Lagrange + BSGS recovery).
 - **`envelopes/`** — JSON transport envelopes + byte codecs (the interop contract).
-- **`ports/`** — the abstraction seams (`data_layer`, `eligibility`, `keyper_p2p`).
+- **`ports/`** — the abstraction seams (`data_layer`, `eligibility`).
 - **`adapters/`** — backends behind the ports (`memory`, `db/`, `chain/`, eligibility).
 - **`services/`** — one domain package per actor, each exposing a `__main__` when
   deployable.
@@ -370,7 +370,7 @@ src/shutter_governance_protocol/
                        #   aggregation, authz, write_auth
   crypto/              # BLS12-381 crypto suite (ElGamal-G2, Schnorr-G1, proofs, DKG)
   envelopes/           # JSON transport envelopes + codecs
-  ports/               # abstraction seams: data_layer, eligibility, keyper_p2p
+  ports/               # abstraction seams: data_layer, eligibility
   adapters/            # backends behind the ports: memory, db/, chain/, eligibility
   services/            # one domain package per actor: keyper/, coordinator/,
                        #   tally_aggregator/, gateway/, admin/, auditor/, data_layer/

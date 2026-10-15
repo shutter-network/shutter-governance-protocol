@@ -13,6 +13,9 @@ export type ElectionConfigView = {
    *  voter's weight was divided by this before aggregation, so the published
    *  totals are in scaled units and will not reconcile with ballot weights. */
   scale: number;
+  /** Which of a wallet's ballots the tally keeps: the highest nonce (`last-wins`) or the
+   *  lowest (`first-wins`), ties broken by position. The dashboard's re-vote view follows it. */
+  duplicatePolicy: "first-wins" | "last-wins";
   thresholdN: bigint;
   thresholdT: bigint;
   keyperAddresses: string[];
@@ -77,6 +80,9 @@ export type EncryptedTally = {
   admittedCount: number;
   /** Sequence numbers of the counted ballots, as the aggregate publishes them. */
   admitted: number[];
+  /** Every ballot the tally did not count, with why (`DUPLICATE_PSEUDONYM` for a
+   *  superseded re-vote; otherwise an invalid or malformed ballot). */
+  exclusions: { sequenceNumber: number; reason: string }[];
 };
 
 export type DecryptionShare = {

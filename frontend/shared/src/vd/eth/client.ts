@@ -39,6 +39,7 @@ export async function fetchElectionOverview(electionId: number): Promise<{
     mode: cfg.mode,
     variant: cfg.variant,
     scale: cfg.scale ?? 1,
+    duplicatePolicy: cfg.duplicatePolicy ?? "last-wins",
     thresholdN: BigInt(cfg.threshold.n),
     thresholdT: BigInt(cfg.threshold.t),
     keyperAddresses: cfg.keypers.map((k) => k.signingKey),
@@ -71,8 +72,18 @@ export async function fetchBallotsPage(
   startIndex: number,
   count: number,
 ): Promise<{ total: bigint; ballots: Ballot[] }> {
-  const resp = await api.listBallots(electionId, Math.max(0, startIndex), count);
-  const ballots: Ballot[] = (resp.ballots as any[]).map((b) => b.malformed !== undefined ? ({
+  // The server may return fewer rows than asked for (pages are capped by size as well
+  // as count, so large ballots come back a few at a time). Keep asking until the page is
+  // full or the list ends, so a page never silently skips the indices it was short by.
+  const raw: any[] = [];
+  let total = 0n;
+  do {
+    const resp = await api.listBallots(electionId, Math.max(0, startIndex) + raw.length, count - raw.length);
+    total = BigInt(resp.total);
+    if (resp.ballots.length === 0) break;
+    raw.push(...resp.ballots);
+  } while (raw.length < count && BigInt(Math.max(0, startIndex) + raw.length) < total);
+  const ballots: Ballot[] = raw.map((b) => b.malformed !== undefined ? ({
     // Kept in place so page positions line up with the API's ballot indices.
     pseudonym: "0x" as Hex, vk: "0x" as Hex, ciphertexts: [], zkProof: "0x" as Hex,
     voterSignature: "0x" as Hex, attestation: null, nonce: 0, weight: 0,
@@ -94,7 +105,7 @@ export async function fetchBallotsPage(
     nonce: Number(b.attestation?.nonce ?? 1),
     weight: Number(b.attestation?.weight ?? 1),
   }));
-  return { total: BigInt(resp.total), ballots };
+  return { total, ballots };
 }
 
 export async function fetchAggregate(electionId: number): Promise<EncryptedTally | null> {
@@ -112,6 +123,9 @@ export async function fetchAggregate(electionId: number): Promise<EncryptedTally
     ),
     admittedCount: (aggregate.admitted ?? []).length,
     admitted: (aggregate.admitted ?? []).map(Number),
+    exclusions: (aggregate.exclusions ?? []).map((e: any) => ({
+      sequenceNumber: Number(e.sequenceNumber), reason: String(e.reason),
+    })),
   };
 }
 

@@ -29,7 +29,9 @@ Backend semantics (``SHUTTER_GOVERNANCE_PROTOCOL_DATA_LAYER``):
 
 from __future__ import annotations
 
-from flask import Blueprint, Flask, jsonify, request
+import json
+
+from flask import Blueprint, Flask, Response, jsonify, request
 
 from shutter_governance_protocol.envelopes import codecs
 from shutter_governance_protocol.ports.data_layer import (
@@ -62,13 +64,23 @@ PORT_READ_PREFIX = "/port"
 # verifies it got a complete, contiguous 0..total-1 read rather than a short one.
 MAX_BALLOT_PAGE = 1000
 
+# A page also stops once its JSON passes this size (it always holds at least one row).
+# The row cap alone allowed 1,000 ballots of any size: ~157 MB at three candidates and
+# budget 100, ~1.3 GB at the form's 2,500-branch limit. Built in memory, held twice on
+# the DB stack (the API's /port proxies this service) and slower than the 10 s client
+# timeout, such a page stalled the tally. Readers page on the rows actually returned.
+MAX_BALLOT_PAGE_BYTES = 8 * 1024 * 1024
+# Rows read from the store per step while filling a page, so a large-ballot page never
+# loads more than this many ballots past the byte budget.
+_BALLOT_READ_BATCH = 100
+
 # Largest request body any shutter_governance_protocol Flask app will buffer. `get_json(force=True)` would
 # otherwise read an arbitrarily large payload into memory before any validation — and the
 # ballot POST is public and unauthenticated.
 #
 # Sized against the biggest *ballot* the config bounds permit: MAX_PROOF_BRANCHES (2500)
 # x 256 bytes x 2 (hex) ~= 1.25 MiB, so 2 MiB leaves headroom. This is an inbound-body
-# limit only — read responses are bounded separately by MAX_BALLOT_PAGE.
+# limit only — read responses are bounded separately by MAX_BALLOT_PAGE(_BYTES).
 MAX_CONTENT_LENGTH = 2 * 1024 * 1024
 
 
@@ -139,8 +151,9 @@ def port_read_blueprint(dl: ElectionDataLayer, *, name: str = "port_read",
     Unlike ``api``'s browser routes this is byte-faithful to the port: bare-hex election
     ids (no decimalization), envelope JSON verbatim, and storage metadata on ballots.
 
-    Ballot pages are capped at ``MAX_BALLOT_PAGE`` — this surface is public, so an
-    uncapped ``count`` would let one request stream an entire election. A
+    Ballot pages are capped at ``MAX_BALLOT_PAGE`` rows and ``MAX_BALLOT_PAGE_BYTES`` of
+    JSON — this surface is public, so an uncapped page would let one request stream an
+    entire election. A page may therefore hold fewer rows than asked for. A
     consumer needing the whole list pages through it with
     ``services.common.reads.read_all_ballots``, which verifies it recovered a complete
     contiguous read: a *silently* short list would make each keyper aggregate a different
@@ -175,23 +188,35 @@ def port_read_blueprint(dl: ElectionDataLayer, *, name: str = "port_read",
 
     @bp.get("/elections/<eid>/ballots")
     def list_ballots(eid):
+        eid_b = _eid()
         start = int(request.args.get("start", 0))
         count = min(int(request.args.get("count", 0)), MAX_BALLOT_PAGE)
         # Storage metadata rides alongside the envelope, never inside it: the ballot
         # JSON is the voter-signed artifact and the conformance-vector surface.
         # A record that could not be decoded is served as ``"ballot": null`` plus its
         # reason, keeping its sequence number, so every reader excludes it the same way.
-        rows = []
-        for sb in dl.list_ballots(_eid(), start, count):
-            row = {
-                "ballot": None if sb.envelope is None else codecs.enc_ballot(sb.envelope),
-                "sequenceNumber": sb.sequence_number,
-                "submittedAt": sb.submitted_at,
-            }
-            if sb.envelope is None:
-                row["malformed"] = sb.malformed_reason
-            rows.append(row)
-        return jsonify(ballots=rows)
+        # Each row is encoded once, here, so the page can stop at the byte budget.
+        parts: list[str] = []
+        size, at = 0, start
+        while len(parts) < count and (not parts or size < MAX_BALLOT_PAGE_BYTES):
+            want = min(_BALLOT_READ_BATCH, count - len(parts))
+            batch = dl.list_ballots(eid_b, at, want)
+            for sb in batch:
+                row = {
+                    "ballot": None if sb.envelope is None else codecs.enc_ballot(sb.envelope),
+                    "sequenceNumber": sb.sequence_number,
+                    "submittedAt": sb.submitted_at,
+                }
+                if sb.envelope is None:
+                    row["malformed"] = sb.malformed_reason
+                parts.append(json.dumps(row, separators=(",", ":")))
+                size += len(parts[-1])
+                if size >= MAX_BALLOT_PAGE_BYTES:
+                    break
+            if len(batch) < want:
+                break  # end of the list
+            at += len(batch)
+        return Response('{"ballots":[' + ",".join(parts) + "]}", mimetype="application/json")
 
     @bp.get("/elections/<eid>/ballots/count")
     def count_ballots(eid):

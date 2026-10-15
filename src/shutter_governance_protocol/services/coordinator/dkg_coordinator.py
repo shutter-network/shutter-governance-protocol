@@ -159,7 +159,7 @@ def ensure_dkg(
 
 def bootstrap_keypers(coordinator, keyper_urls: dict[int, str], *, member_addrs: dict[int, bytes],
                       relay_token: str | None = None, token_store=None, install: set[int] | None = None,
-                      timeout: float = 10.0):
+                      require: set[int] | None = None, timeout: float = 10.0):
     """Install per-keyper channel credentials via each keyper's /auth/bootstrap.
 
     Each keyper's ``{api_token, peer_token}`` is a **stable per-(coordinator, keyper)
@@ -178,6 +178,11 @@ def bootstrap_keypers(coordinator, keyper_urls: dict[int, str], *, member_addrs:
     ``relay_token`` (the coordinator's write-relay bearer) rides inside the same
     sealed+signed payload so keypers need not pre-share it. Returns
     ``(api_tokens, peer_tokens)`` keyed by keyper index (all members).
+
+    ``require`` (default: every member) names the keypers that must answer. Any other
+    keyper that does not is logged and left out: of the peer map, and of the install.
+    The DKG keeps the default, because dealers seal a share to every member. The tally
+    needs only the api tokens, so one keyper being down must not stop the others.
     """
     api_tokens: dict[int, str] = {}
     peer_tokens: dict[int, str] = {}
@@ -206,11 +211,16 @@ def bootstrap_keypers(coordinator, keyper_urls: dict[int, str], *, member_addrs:
             enc_pub[i] = boot.verify_encryption_pubkey(member_addrs[i], enc_hex, enc_sig)
             enc_raw[i] = {"enc_pubkey": enc_hex, "enc_pubkey_sig": enc_sig}
         except Exception as err:  # noqa: BLE001 — re-raised; caller backs off and retries
+            if require is not None and i not in require:
+                _LOG.warning("op=bootstrap keyper=%d url=%s status=skipped err=%s", i, url, err)
+                continue
             _LOG.error("op=bootstrap keyper=%d url=%s status=enc_pubkey_error err=%s", i, url, err)
             raise
 
     targets = keyper_urls if install is None else {i: keyper_urls[i] for i in install}
     for i, url in targets.items():
+        if i not in enc_pub:  # unreachable and not required (skipped above)
+            continue
         # Seal+sign this keyper's bundle and install it — attributing any failure to the
         # specific keyper so a stuck committee names the culprit, not a generic error.
         try:
@@ -221,7 +231,7 @@ def bootstrap_keypers(coordinator, keyper_urls: dict[int, str], *, member_addrs:
                 # Each peer entry: where to reach it, what to authenticate with, and the
                 # X25519 key to seal shares to (the dealer re-verifies it before sealing).
                 "peers": {str(j): {"url": keyper_urls[j], "token": peer_tokens[j], **enc_raw[j]}
-                          for j in keyper_urls if j != i},
+                          for j in keyper_urls if j != i and j in enc_raw},
                 "nonce": secrets.token_hex(16),
                 "timestamp": int(time.time()),
             }
@@ -230,6 +240,9 @@ def bootstrap_keypers(coordinator, keyper_urls: dict[int, str], *, member_addrs:
             requests.post(url.rstrip("/") + "/auth/bootstrap",
                           json={"sealed": sealed.hex(), "signature": sig.hex()}, timeout=timeout).raise_for_status()
         except Exception as err:  # noqa: BLE001 — re-raised; caller backs off and retries
+            if require is not None and i not in require:
+                _LOG.warning("op=bootstrap keyper=%d url=%s status=skipped err=%s", i, url, err)
+                continue
             _LOG.error("op=bootstrap keyper=%d url=%s status=error err=%s", i, url, err)
             raise
         _LOG.debug("op=bootstrap keyper=%d url=%s status=installed token=%s",
@@ -237,12 +250,20 @@ def bootstrap_keypers(coordinator, keyper_urls: dict[int, str], *, member_addrs:
     return api_tokens, peer_tokens
 
 
+def _needs_token(r) -> bool:
+    """The keyper does not hold our token: a ``401``, or the ``503`` a keyper answers when
+    it has no token at all (restarted after losing its saved tokens). Both are fixed by
+    re-installing the keyper's stable token."""
+    return r.status_code == 401 or (r.status_code == 503 and "keyper not bootstrapped" in r.text)
+
+
 def _post_keyper(url: str, path: str, election_id: bytes, api_tokens: dict[int, str], i: int,
                  *, rebootstrap=None, timeout: float, op: str | None = None, extra: dict | None = None):
     """POST a coordinator→keyper trigger, recovering from a stale-token 401.
 
-    On ``401`` — the keyper doesn't hold the token we presented (state loss, or a
-    credential the coordinator minted but never installed on this keyper) — call
+    On ``401`` or "not bootstrapped" ``503`` (see ``_needs_token``) — the keyper doesn't
+    hold the token we presented (state loss, or a credential the coordinator minted but
+    never installed on this keyper) — call
     ``rebootstrap(i)`` to re-install this keyper's *stable* credential and retry once
     with the returned token. Because credentials are per-keyper (Option D), re-installing
     keyper ``i`` never disturbs any other keyper, so this can't ping-pong between
@@ -259,8 +280,8 @@ def _post_keyper(url: str, path: str, election_id: bytes, api_tokens: dict[int, 
     try:
         r = requests.post(url.rstrip("/") + path, json=body,
                           headers={"Authorization": f"Bearer {api_tokens[i]}"}, timeout=timeout)
-        if r.status_code == 401 and rebootstrap is not None:
-            _LOG.info("op=%s keyper=%d status=reauth election=%s (401 → re-bootstrap + retry)", op, i, eid_hex)
+        if _needs_token(r) and rebootstrap is not None:
+            _LOG.info("op=%s keyper=%d status=reauth election=%s (http=%d → re-bootstrap + retry)", op, i, eid_hex, r.status_code)
             token = rebootstrap(i)  # re-install stable token; returns it (unchanged) or None
             if token:
                 api_tokens[i] = token
@@ -279,7 +300,7 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
     """Sequence the DKG ceremony over HTTP; return whether the key finalized.
 
     ``rebootstrap(i)`` (optional) re-installs keyper ``i``'s stable credential and
-    returns its token; used to recover a phase call that comes back ``401``."""
+    returns its token; used to recover a phase call that needs a token (``_needs_token``)."""
     eid_hex = election_id.hex()
 
     def call(i: int, phase: str, extra: dict | None = None):
@@ -288,7 +309,7 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
         try:
             r = requests.post(keyper_urls[i].rstrip("/") + path, json=body,
                               headers={"Authorization": f"Bearer {api_tokens[i]}"}, timeout=timeout)
-            if r.status_code == 401 and rebootstrap is not None:
+            if _needs_token(r) and rebootstrap is not None:
                 _LOG.info("op=dkg phase=%s keyper=%d status=reauth election=%s", phase, i, eid_hex)
                 token = rebootstrap(i)
                 if token:

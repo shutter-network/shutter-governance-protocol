@@ -2,7 +2,7 @@
 
 Encode/decode each artifact type to/from a JSON-ready ``dict`` with ``0x``-hex
 byte fields. Decoders validate hex formatting and the fixed byte sizes of the
-crypto suite (:data:`shutter_governance_protocol.envelopes.types.SIZES`), so malformed input is rejected
+crypto suite (:mod:`shutter_governance_protocol.crypto.params`), so malformed input is rejected
 at the boundary rather than surfacing later as an opaque crypto failure.
 
 These dicts are the exact shapes the database adapter and the gateway API

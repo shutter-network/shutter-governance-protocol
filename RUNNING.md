@@ -295,7 +295,8 @@ when eyeballing an election by hand (the curls above). They are *display-shaped*
 ids are decimalized and ballot pages cap at 200. The `/port` routes
 (`/port/elections/<64-hex>/…`) are the byte-verbatim `ElectionDataLayer` contract —
 bare-hex ids and ballot storage metadata. Port ballot pages are capped at 1,000
-records; request a positive `count` and advance `start` until all records are read. Use `/port` when the bytes matter
+records and about 8 MiB of JSON, so a page of large ballots holds fewer; request a positive
+`count` and advance `start` by the rows actually returned until all records are read. Use `/port` when the bytes matter
 (re-deriving a digest, verifying a signature, reading every ballot) and when writing a
 client that speaks the port; that is what keypers point `SHUTTER_GOVERNANCE_PROTOCOL_API_URL` at.
 

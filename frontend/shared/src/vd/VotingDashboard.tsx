@@ -5,6 +5,7 @@
  * verification and per-share DLEQ verify are disabled; the "Verify yourself" guide panels
  * (instructional + fixture download) stay. */
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { ballotStatuses, EMPTY_STATUSES, type BallotStatuses } from "./ballotStatus";
 import { Trans, useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import "./i18n";
@@ -165,45 +166,8 @@ function computeOverviewDisplay(p: {
 }
 
 const PAGE_SIZE = 10;
-
-/** Client-side re-vote dedup, mirroring the tally's `last-wins` admission (a wallet may
- * re-cast until close; only the latest same-pseudonym ballot is counted). The winner per
- * pseudonym is the highest attestation **nonce** (tie-break: later index), exactly as
- * `admit()` orders by `(nonce, sequence)` — so a replayed old ballot (lower nonce) is shown
- * superseded regardless of when it was submitted. Computed over the FULL ordered ballot list
- * (the data layer stores every submission on both backends, so a duplicate can span pages).
- * Returns the absolute indexes that are superseded, the pseudonyms re-voted at all, and
- * `counted` = distinct pseudonyms (what actually enters the aggregate). */
-export interface BallotDedup { superseded: Set<number>; revoted: Set<string>; counted: number }
-
-const EMPTY_DEDUP: BallotDedup = { superseded: new Set(), revoted: new Set(), counted: 0 };
-
-async function fetchAllBallotsFor(electionId: number, total: number): Promise<Ballot[]> {
-  const all: Ballot[] = [];
-  for (let off = 0; off < total; off += PAGE_SIZE) {
-    const { ballots: pg } = await fetchBallotsPage(electionId, off, PAGE_SIZE);
-    if (pg.length === 0) break;
-    all.push(...pg);
-  }
-  return all;
-}
-
-function computeBallotDedup(all: Ballot[]): BallotDedup {
-  const winnerIdx = new Map<string, number>(); // pseudonym -> winning (highest-nonce) index
-  const seen = new Map<string, number>();        // pseudonym -> occurrence count
-  all.forEach((b, i) => {
-    if (b.malformed !== undefined) return; // never counted, and has no real pseudonym
-    seen.set(b.pseudonym, (seen.get(b.pseudonym) ?? 0) + 1);
-    const cur = winnerIdx.get(b.pseudonym);
-    // last-wins by (nonce, index): higher nonce wins; equal nonce → later index.
-    if (cur === undefined || b.nonce >= all[cur].nonce) winnerIdx.set(b.pseudonym, i);
-  });
-  const superseded = new Set<number>();
-  all.forEach((b, i) => { if (b.malformed === undefined && winnerIdx.get(b.pseudonym) !== i) superseded.add(i); });
-  const revoted = new Set<string>();
-  seen.forEach((n, p) => { if (n > 1) revoted.add(p); });
-  return { superseded, revoted, counted: winnerIdx.size };
-}
+// Ballots per request when catching the status cache up (the API's page limit).
+const BALLOT_SYNC_PAGE = 200;
 
 export function VotingDashboard({ electionId, elections, onSelectElection, headerAction, audience = "voter" }: {
   electionId: number;
@@ -239,9 +203,10 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
   const [detailView, setDetailView] = useState<{ pseudonym: string; globalIndex: number } | null>(null);
   const [downloadingAggFixture, setDownloadingAggFixture] = useState(false);
   const [exportingFixture, setExportingFixture] = useState(false);
-  // Re-vote dedup over the full ballot list (last-wins), for the counted-vs-recorded counts
-  // and the per-row superseded/counted badges.
-  const [dedup, setDedup] = useState<BallotDedup>(EMPTY_DEDUP);
+  // Which ballots count, for the counted-vs-recorded counts and the per-row badges:
+  // provisional during voting (the election's duplicate policy), the tally's own once the
+  // aggregate is published. See ballotStatus.ts.
+  const [statuses, setStatuses] = useState<BallotStatuses>(EMPTY_STATUSES);
   // On-demand verification: per-ballot (by absolute index — a pseudonym is NOT unique once a
   // wallet re-votes) and per-keyper share (by keyperIndex).
   const [ballotVerify, setBallotVerify] = useState<Record<number, VState>>({});
@@ -254,8 +219,15 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
     let alive = true;
     setTab("overview"); setPage(0); pageRef.current = 0; setDetailView(null); setShowVerifyGuide(false); setShowVerifyPanel(false);
     setOverview(null); setAggregate(null); setShares(null); setResult(null);
-    setBallotVerify({}); setShareVerify({}); setDedup(EMPTY_DEDUP);
+    setBallotVerify({}); setShareVerify({}); setStatuses(EMPTY_STATUSES);
+    // Every ballot fetched so far, in order. Ballots are append-only, so each poll fetches
+    // only the ones added since; re-reading the whole list every 5 s was 1,000 requests a
+    // poll per open tab at 10,000 ballots. One poll at a time: a slow one is not stacked on.
+    const all: Ballot[] = [];
+    let running = false;
     async function load() {
+      if (running) return;
+      running = true;
       try {
         const shownPage = pageRef.current;
         const [ov, agg, sh, res, current] = await Promise.all([
@@ -268,12 +240,16 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
         // Only if the user is still on the page this poll fetched; a page change in the
         // meantime has its own fetch (the effect below).
         if (pageRef.current === shownPage) setBallots(current.ballots);
-        // Dedup needs the whole ordered list (a re-vote may span pages). One page suffices
-        // when it already holds everything; otherwise fetch the rest.
+        // Statuses need the whole ordered list (a re-vote may span pages).
         const total = Number(current.total);
-        const all = total <= PAGE_SIZE && shownPage === 0 ? current.ballots : await fetchAllBallotsFor(electionId, total);
-        if (alive) setDedup(computeBallotDedup(all));
+        while (alive && all.length < total) {
+          const { ballots: pg } = await fetchBallotsPage(electionId, all.length, BALLOT_SYNC_PAGE);
+          if (pg.length === 0) break;
+          all.push(...pg);
+        }
+        if (alive) setStatuses(ballotStatuses(all, ov.config.duplicatePolicy, agg));
       } catch (e) { if (alive) setLoadError(e instanceof Error ? e.message : String(e)); }
+      finally { running = false; }
     }
     void load();
     const h = setInterval(load, 5000);
@@ -302,10 +278,10 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
   // not unique once a wallet re-votes, so a pseudonym lookup would return the wrong ballot.
   const detailBallot = detailView ? (ballots[detailView.globalIndex - page * PAGE_SIZE] ?? null) : null;
   // Recorded (every stored ballot) vs counted (distinct pseudonyms, last-wins). Fall back to
-  // recorded until the dedup pass has run, so we never flash a premature "0 counted".
+  // recorded until the status pass has run, so we never flash a premature "0 counted".
   const recordedBallots = Number(overviewBallotTotal);
-  const countedBallots = dedup.counted || recordedBallots;
-  const supersededBallots = Math.max(0, recordedBallots - countedBallots);
+  const countedBallots = statuses.counted || recordedBallots;
+  const supersededBallots = statuses.superseded.size;
   const isTriple =
     (showVerifyPanel && tab === "ballots" && !!detailBallot && !!detailView) ||
     (showVerifyGuide && ((tab === "aggregate" && !!aggregate) || (tab === "shares" && !!shares && !!aggregate) || (tab === "result" && !!result && !!aggregate && !!shares)));
@@ -337,7 +313,9 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
     switch (num) {
       case 1: return { title: t("{{n}} of {{n}} keypers ready", { n: overview.config.thresholdN.toString() }), sub: t("Encryption committee finalized") };
       case 2: return supersededBallots > 0
-        ? { title: t("{{c}} of {{r}} ballots counted", { c: countedBallots, r: recordedBallots }), sub: t("{{s}} superseded by re-votes", { s: supersededBallots }) }
+        ? { title: t("{{c}} of {{r}} ballots counted", { c: countedBallots, r: recordedBallots }), sub: statuses.final
+          ? t("{{s}} superseded by re-votes", { s: supersededBallots })
+          : t("{{s}} superseded by re-votes · provisional until the count", { s: supersededBallots }) }
         : { title: t("{{n}} ballots accepted", { n: overviewBallotTotal.toString() }), sub: t("Voting closed") };
       case 3: return aggregate ? { title: t("{{n}} ballots summed", { n: countedBallots.toString() }), sub: t("Into {{n}} encrypted candidate totals", { n: aggregate.aggregates.length }) } : null;
       case 4: return shares ? { title: t("{{count}} of {{total}} keyper shares received", { count: shares.length, total: overview.config.thresholdN.toString() }), sub: t("Threshold met · tally decrypted") } : null;
@@ -691,8 +669,9 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
                         <div className="blList">
                           {ballots.map((b, index) => {
                             const globalIndex = page * PAGE_SIZE + index;
-                            const isSuperseded = dedup.superseded.has(globalIndex);
-                            const isRevoted = dedup.revoted.has(b.pseudonym);
+                            const isSuperseded = statuses.superseded.has(globalIndex);
+                            const excludedFor = statuses.excluded.get(globalIndex);
+                            const isRevoted = statuses.revoted.has(b.pseudonym);
                             return (
                               <div key={`ballot-${globalIndex}`} className={`blRow${isSuperseded ? " blRow--superseded" : ""}`} role="button" tabIndex={0} onClick={() => { setDetailView({ pseudonym: b.pseudonym, globalIndex }); setShowVerifyPanel(false); }} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setDetailView({ pseudonym: b.pseudonym, globalIndex }); setShowVerifyPanel(false); } }}>
                                 <div className="blRowIndex"><div className="blRowIndexLabel">index {globalIndex}</div></div>
@@ -702,13 +681,21 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
                                     <span className="tip tip--end" data-tip={t("This record could not be read as a ballot — not counted")}>
                                       <span className="blBadge blBadge--superseded">{t("malformed")}</span>
                                     </span>
+                                  ) : excludedFor !== undefined ? (
+                                    <span className="tip tip--end" data-tip={t("The tally excluded this ballot ({{reason}}) — not counted", { reason: excludedFor })}>
+                                      <span className="blBadge blBadge--superseded">{t("excluded")}</span>
+                                    </span>
                                   ) : isSuperseded ? (
-                                    <span className="tip tip--end" data-tip={t("A later ballot from this wallet replaced it — not counted")}>
-                                      <span className="blBadge blBadge--superseded">{t("superseded")}</span>
+                                    <span className="tip tip--end" data-tip={statuses.final
+                                      ? t("Another ballot from this wallet replaced it — not counted")
+                                      : t("Another ballot from this wallet replaces it, if that one is valid — provisional until the count")}>
+                                      <span className="blBadge blBadge--superseded">{statuses.final ? t("superseded") : t("superseded?")}</span>
                                     </span>
                                   ) : isRevoted ? (
-                                    <span className="tip tip--end" data-tip={t("The wallet's latest re-vote — this is the one counted")}>
-                                      <span className="blBadge blBadge--counted">{t("counted")}</span>
+                                    <span className="tip tip--end" data-tip={statuses.final
+                                      ? t("The wallet's ballot the tally counted")
+                                      : t("The wallet's ballot that counts, if it is valid — provisional until the count")}>
+                                      <span className="blBadge blBadge--counted">{statuses.final ? t("counted") : t("counts?")}</span>
                                     </span>
                                   ) : null}
                                 </div>

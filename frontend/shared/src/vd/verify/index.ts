@@ -138,28 +138,3 @@ export async function verifySharesLocal(electionId: bigint, numCandidates: numbe
   }
   return { ok, verdicts };
 }
-
-// ── 4. result (threshold decrypt + BSGS, compared to the published tally) ───
-export async function verifyResultLocal(
-  electionId: bigint, numCandidates: number, quorum: number, bsgsBound: bigint,
-  aggregate: Ct[], committeePks: string[], shares: VShare[], tally: bigint[],
-): Promise<VerifyResult> {
-  const S = await sdk();
-  const eid = electionId32(electionId);
-  const g2 = (h: string) => S.G2Point.fromBytes(fromHex(h));
-  const table = S.buildBabyStepTable(BigInt(bsgsBound));
-  for (let j = 0; j < numCandidates; j++) {
-    const ct = { c1: g2(aggregate[j].c1), c2: g2(aggregate[j].c2) };
-    const valid: any[] = [];
-    for (const s of shares) {
-      const member = s.keyperIndex - 1;
-      const share = { keyperIndex: s.keyperIndex, sigma: g2(s.shares[j]), proof: { e: BigInt(s.proofs[j].e), z: BigInt(s.proofs[j].z) } };
-      if (S.verifyDecryptionShare(ct, share, g2(committeePks[member]), decryptTranscript(S, eid, j))) valid.push(share);
-      if (valid.length >= quorum) break;
-    }
-    if (valid.length < quorum) return { ok: false, reason: `candidate ${j}: only ${valid.length} valid shares (need ${quorum})` };
-    const total = S.recoverDiscreteLogWithTable(S.combineShares(valid, valid.map((sh) => BigInt(sh.keyperIndex)), ct), table);
-    if (total !== BigInt(tally[j])) return { ok: false, reason: `candidate ${j}: recovered ${total} ≠ published ${tally[j]}` };
-  }
-  return { ok: true };
-}
