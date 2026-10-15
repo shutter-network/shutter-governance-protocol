@@ -148,6 +148,27 @@ def dec_attestation(d: Any, *, name: str = "attestation") -> Attestation:
 #  Ballot
 # --------------------------------------------------------------------------- #
 
+#: What decoding untrusted ballot data can raise. ``CodecError``, ``JSONDecodeError`` and
+#: ``UnicodeDecodeError`` are all ``ValueError``s; the others come from JSON of the wrong
+#: shape (a list or a number where an object belongs).
+BALLOT_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError)
+
+
+def dec_stored_ballot(d: Any) -> tuple[BallotEnvelope | None, str | None]:
+    """Decode a *stored* ballot: ``(envelope, None)``, or ``(None, reason)`` if it cannot be.
+
+    For read paths only. A write must still reject a bad ballot with :func:`dec_ballot`,
+    but a record that is already stored has to stay readable so admission can exclude
+    it; see :class:`StoredBallot`.
+    """
+    if d is None:
+        return None, "missing ballot"
+    try:
+        return dec_ballot(d), None
+    except BALLOT_DECODE_ERRORS as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 def enc_ballot(b: BallotEnvelope) -> dict:
     return {
         "electionId": enc_bytes(b.election_id),

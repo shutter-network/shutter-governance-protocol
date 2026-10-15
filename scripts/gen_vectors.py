@@ -21,6 +21,7 @@ from shutter_governance_protocol.core.aggregation import build_aggregate_artifac
 from shutter_governance_protocol.core.config import DuplicatePolicy, ElectionConfig, KeyperIdentity, Mode, Threshold, Variant
 from shutter_governance_protocol.crypto import attestation as att, ballot as ballot_crypto, proofs, schnorr
 from shutter_governance_protocol.crypto.dkg import KeyperDKGState, derive_joint_mpk, derive_mpk_share
+from shutter_governance_protocol.crypto.params import CURVE_ORDER
 from shutter_governance_protocol.crypto.points import G2, g1_to_compressed, g2_from_compressed, g2_to_compressed, mul
 from shutter_governance_protocol.envelopes import codecs
 from shutter_governance_protocol.envelopes.types import (
@@ -61,7 +62,9 @@ def gen_attestation():
             "name": name, "description": desc, "version": 1,
             "inputs": {
                 "eligibilityKey": elig_key.hex(), "electionId": election_id.hex(),
-                "pseudonym": pseudonym.hex(), "vk": vk.hex(), "weight": weight, "nonce": nonce,
+                # Decimal strings, not JSON numbers: a JavaScript reader rounds any integer
+                # above 2^53, and the non-canonical vectors carry 77-digit values.
+                "pseudonym": pseudonym.hex(), "vk": vk.hex(), "weight": str(weight), "nonce": str(nonce),
                 "scheme": scheme, "signature": sig.hex(),
             },
             "expected": {"verify": verify},
@@ -83,6 +86,18 @@ def gen_attestation():
     _write("attestation", "attestation_v1_tampered_nonce",
            att_obj("attestation_v1_tampered_nonce", "Signature over nonce=1 but envelope claims nonce=2.",
                    weight=5, scheme="ATTESTATION_V1", election_id=ELECTION_ID, sig=sig_v1, verify=False, nonce=2))
+
+    # Negative: non-canonical weight / nonce. ``5 + q`` and ``1 + q`` are the same scalars
+    # as the signed 5 and 1, so a verifier that reduced mod q would accept them while the
+    # tally counted the raw, enormous integers. Both must be rejected.
+    _write("attestation", "attestation_v1_weight_plus_q",
+           att_obj("attestation_v1_weight_plus_q", "Signature over weight=5 but envelope claims weight=5+q.",
+                   weight=5 + CURVE_ORDER, scheme="ATTESTATION_V1", election_id=ELECTION_ID, sig=sig_v1,
+                   verify=False))
+    _write("attestation", "attestation_v1_nonce_plus_q",
+           att_obj("attestation_v1_nonce_plus_q", "Signature over nonce=1 but envelope claims nonce=1+q.",
+                   weight=5, scheme="ATTESTATION_V1", election_id=ELECTION_ID, sig=sig_v1, verify=False,
+                   nonce=1 + CURVE_ORDER))
 
     # Negative: wrong-election binding (signature over a different election id).
     other = bytes.fromhex("99" * 32)

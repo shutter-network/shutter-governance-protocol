@@ -294,14 +294,16 @@ class PostgresStore(ElectionDataLayer):
                 "WHERE election_id = %s AND seq >= %s ORDER BY seq LIMIT %s",
                 (election_id, start, count),
             ).fetchall()
-            return [
-                StoredBallot(
+            out = []
+            for seq, ballot, submitted_at in rows:
+                envelope, reason = codecs.dec_stored_ballot(ballot)
+                out.append(StoredBallot(
                     sequence_number=int(seq),
-                    envelope=codecs.dec_ballot(ballot),
+                    envelope=envelope,
                     submitted_at=None if submitted_at is None else int(submitted_at),
-                )
-                for seq, ballot, submitted_at in rows
-            ]
+                    malformed_reason=reason,
+                ))
+            return out
 
     def count_ballots(self, election_id) -> int:
         with self._conn() as conn:

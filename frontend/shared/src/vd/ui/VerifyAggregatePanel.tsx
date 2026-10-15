@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import type { EncryptedTally } from "../eth/types";
 import { CodeBlock } from "./CodeBlock";
 
-const SDK_PACKAGE = "@shutter-network/urban-verified-crypto";
+import { SDK_PACKAGE, SDK_VERSION } from "./sdk";
 
 type Props = {
   aggregate: EncryptedTally;
@@ -15,61 +15,43 @@ export function VerifyAggregatePanel({ aggregate, onDownloadFixture, downloading
   const fixtureFilename = "aggregate-fixture.json";
   const scriptName = "verify-aggregate.js";
 
-  const installCmd = `npm install ${SDK_PACKAGE} viem`;
+  const installCmd = `npm install ${SDK_PACKAGE}@${SDK_VERSION}`;
 
   const scriptCode = [
-    `const { initCurves, G1Point, G2Point, schnorrVerify, verifyBallot, sumCts, scalarMulCt } = require("${SDK_PACKAGE}");`,
+    `const { initCurves, G2Point, verifyBallot, sumCts, scalarMulCt } = require("${SDK_PACKAGE}");`,
     `const { readFileSync } = require("node:fs");`,
-    `const { keccak256 } = require("viem");`,
     `const fromHex   = (h) => Uint8Array.from(Buffer.from(String(h).replace(/^0x/, ""), "hex"));`,
     `const g2FromHex = (h) => G2Point.fromBytes(fromHex(h));`,
     `const electionId32 = (id) => fromHex(BigInt(id).toString(16).padStart(64, "0"));`,
-    `// weight packed at att[1..33] (32-byte BE) — the aggregate is Σ weightᵢ·ctᵢ.`,
-    `const attWeight = (attHex) => { const a = fromHex(attHex); let w = 0n; for (let i = 1; i < 33; i++) w = (w << 8n) + BigInt(a[i]); return w; };`,
-    `// att packs scheme(1) ‖ weight(32 BE) ‖ nonce(32 BE) ‖ R(48) ‖ s(32). Dispatches on scheme`,
-    `// like shutter_governance_protocol's verify_attestation: 1=ATTESTATION_V1 (transcript), 0=LEGACY (weightless, weight 1).`,
-    `const u32be = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0); return b; };`,
-    `const scalar32 = (w) => { const b = Buffer.alloc(32); let x = BigInt(w); for (let i = 31; i >= 0 && x > 0n; i--) { b[i] = Number(x & 0xffn); x >>= 8n; } return b; };`,
-    `const tlv = (p, tag, v) => { const tb = Buffer.from(tag, "utf8"); p.push(u32be(tb.length), tb, u32be(v.length), Buffer.from(v)); };`,
-    `const v1Digest = (eid, ps, vk, w, n) => { const p = [Buffer.from("SHUTTER-VOTE-ATTEST-v1", "utf8")]; tlv(p, "attest:electionId", eid); tlv(p, "attest:pseudonym", ps); tlv(p, "attest:vk", vk); tlv(p, "attest:weight", scalar32(w)); tlv(p, "attest:nonce", scalar32(n)); return fromHex(keccak256(Buffer.concat(p))); };`,
-    `const legacyDigest = (eid, ps, vk) => fromHex(keccak256(Buffer.concat([Buffer.from(eid), Buffer.from(ps), Buffer.from(vk)])));`,
-    `const makeWrVerifier = (pkWr) => {`,
-    `  const wrVk = G1Point.fromBytes(pkWr);`,
-    `  return (eid, ps, vk, att) => {`,
-    `    if (eid.length !== 32 || ps.length !== 32 || vk.length !== 48) return false;`,
-    `    try {`,
-    `      const scheme = att[0];`,
-    `      let w = 0n; for (let i = 1; i < 33; i++) w = (w << 8n) + BigInt(att[i]);`,
-    `      let n = 0n; for (let i = 33; i < 65; i++) n = (n << 8n) + BigInt(att[i]);`,
-    `      if (w < 1n || (scheme !== 1 && w !== 1n) || (scheme === 1 && n < 1n)) return false;`,
-    `      const sig = att.subarray(65);`,
-    `      let s = 0n; for (let i = 48; i < 80; i++) s = (s << 8n) + BigInt(sig[i]);`,
-    `      const msg = scheme === 1 ? v1Digest(eid, ps, vk, w, n) : legacyDigest(eid, ps, vk);`,
-    `      return schnorrVerify(wrVk, msg, { R: G1Point.fromBytes(sig.subarray(0, 48)), s });`,
-    `    } catch { return false; }`,
-    `  };`,
-    `};`,
+    `// One attested weight in the units the tally counts: integer half-up (w + s/2) / s.`,
+    `const scaled = (w, s) => (BigInt(w) + BigInt(s) / 2n) / BigInt(s);`,
     `async function main() {`,
     `  const f = JSON.parse(readFileSync("${fixtureFilename}", "utf8"));`,
     `  await initCurves();`,
-    `  const mpk        = g2FromHex(f.mpkElectionG2);`,
-    `  const wrVerifier = makeWrVerifier(fromHex(f.pkWrG1));`,
-    `  const config     = { numCandidates: f.numCandidates, budget: f.budget, mode: f.mode ?? "exact", variant: f.variant ?? "A" };`,
-    `  const electionIdBytes = electionId32(f.electionId);`,
-    `  // Filter to locally valid ballots — mirrors what the on-chain aggregator does.`,
-    `  const validBallots = f.ballots.filter((b) => {`,
+    `  const mpk    = g2FromHex(f.mpkElectionG2);`,
+    `  const config = { numCandidates: f.numCandidates, budget: f.budget, mode: f.mode ?? "exact", variant: f.variant ?? "A" };`,
+    `  // The aggregate publishes which ballots it counted (f.admitted: sequence numbers, which`,
+    `  // index f.ballots). Each of them must be a valid ballot...`,
+    `  for (const seq of f.admitted) {`,
+    `    const b = f.ballots[seq], a = b?.attestation;`,
+    `    if (!a) { console.log(\`✗ admitted ballot \${seq} is missing or malformed\`); process.exit(1); }`,
     `    const res = verifyBallot(`,
-    `      { electionId: electionIdBytes, pseudonym: fromHex(b.pseudonym), vk: fromHex(b.vk),`,
+    `      { electionId: electionId32(f.electionId), pseudonym: fromHex(b.pseudonym), vk: fromHex(b.vk),`,
     `        ciphertexts: b.ciphertexts.map(({ c1, c2 }) => [fromHex(c1), fromHex(c2)]),`,
-    `        zkProof: fromHex(b.zkProof), voterSignature: fromHex(b.voterSignature), wrAttestation: fromHex(b.wrAttestation) },`,
-    `      config, mpk, wrVerifier,`,
-    `    );`,
-    `    return res.ok;`,
-    `  });`,
-    `  console.log(\`Using \${validBallots.length} of \${f.ballots.length} ballots (locally valid)\`);`,
+    `        zkProof: fromHex(b.zkProof), voterSignature: fromHex(b.voterSignature),`,
+    `        attestation: { electionId: electionId32(a.electionId), pseudonym: fromHex(a.pseudonym), vk: fromHex(a.vk),`,
+    `                       weight: BigInt(a.weight), nonce: BigInt(a.nonce), signature: fromHex(a.signature) } },`,
+    `      config, mpk, fromHex(f.pkWrG1));`,
+    `    if (!res.ok) { console.log(\`✗ admitted ballot \${seq} is invalid: \${res.reason}\`); process.exit(1); }`,
+    `  }`,
+    `  console.log(\`Summing \${f.admitted.length} admitted ballots of \${f.ballots.length} stored\`);`,
+    `  // ...and their weighted sum must be the published aggregate.`,
     `  let ok = true;`,
     `  for (let j = 0; j < f.numCandidates; j++) {`,
-    `    const sum = sumCts(validBallots.map((b) => scalarMulCt(attWeight(b.wrAttestation), { c1: g2FromHex(b.ciphertexts[j].c1), c2: g2FromHex(b.ciphertexts[j].c2) })));`,
+    `    const terms = f.admitted.map((seq) => f.ballots[seq])`,
+    `      .map((b) => ({ w: scaled(b.attestation.weight, f.scale ?? 1), b })).filter((x) => x.w > 0n)`,
+    `      .map(({ w, b }) => scalarMulCt(w, { c1: g2FromHex(b.ciphertexts[j].c1), c2: g2FromHex(b.ciphertexts[j].c2) }));`,
+    `    const sum = sumCts(terms);`,
     `    const pub = { c1: g2FromHex(f.aggregate[j].c1), c2: g2FromHex(f.aggregate[j].c2) };`,
     `    const match = sum.c1.equals(pub.c1) && sum.c2.equals(pub.c2);`,
     `    if (!match) ok = false;`,
@@ -84,7 +66,7 @@ export function VerifyAggregatePanel({ aggregate, onDownloadFixture, downloading
   const candidateLines = aggregate.aggregates
     .map((_, j) => `Candidate ${j}: ✓ match`)
     .join("\n");
-  const expectedOutput = `Using N of N ballots (locally valid)\n${candidateLines}\n\n✓ Aggregate verified`;
+  const expectedOutput = `Summing N admitted ballots of M stored\n${candidateLines}\n\n✓ Aggregate verified`;
 
   return (
     <div className="vpInline" role="region" aria-label={t("Aggregate verification guide")}>

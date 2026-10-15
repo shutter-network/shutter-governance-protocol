@@ -24,7 +24,7 @@ from __future__ import annotations
 from eth_utils import keccak
 
 from shutter_governance_protocol.crypto import schnorr
-from shutter_governance_protocol.crypto.params import ATTESTATION_LABEL
+from shutter_governance_protocol.crypto.params import ATTESTATION_LABEL, CURVE_ORDER
 from shutter_governance_protocol.crypto.points import g1_from_compressed
 from shutter_governance_protocol.crypto.transcript import Transcript
 
@@ -41,6 +41,13 @@ def _attestation_transcript(election_id: bytes, pseudonym: bytes, vk_bytes: byte
         raise ValueError(f"weight must be >= 1 (got {weight})")
     if nonce < 1:
         raise ValueError(f"nonce must be >= 1 (got {nonce})")
+    # Both are signed as scalars but counted as plain integers, so each must have
+    # exactly one encoding: ``weight + CURVE_ORDER`` would otherwise carry the same
+    # signature as ``weight`` while inflating the tally bound.
+    if weight >= CURVE_ORDER:
+        raise ValueError("weight must be < CURVE_ORDER")
+    if nonce >= CURVE_ORDER:
+        raise ValueError("nonce must be < CURVE_ORDER")
     t = Transcript(ATTESTATION_LABEL)
     t.append("attest:electionId", election_id)
     t.append("attest:pseudonym", pseudonym)
@@ -74,7 +81,7 @@ def verify_attestation_sig(elig_vk_bytes: bytes, election_id: bytes, pseudonym: 
     try:
         if len(election_id) != 32 or len(pseudonym) != 32 or len(vk_bytes) != 48:
             return False
-        if weight < 1 or nonce < 1:
+        if not (1 <= weight < CURVE_ORDER and 1 <= nonce < CURVE_ORDER):
             return False
         elig_vk = g1_from_compressed(elig_vk_bytes)
         R, s = schnorr.decode(signature)

@@ -21,11 +21,13 @@ type Props = {
   verifyState: VerifyState;
   onBack: () => void;
   onVerifyLocally: () => void;
+  onToggleGuide: () => void;
+  guideOpen: boolean;
   txHash?: string | null;
   explorerUrl?: string;
 };
 
-export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerifyLocally, txHash, explorerUrl }: Props) {
+export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerifyLocally, onToggleGuide, guideOpen, txHash, explorerUrl }: Props) {
   const { t } = useTranslation();
   const vs = verifyState.status;
   const iconType = vs === "ok" ? "ok" : vs === "bad" ? "bad" : vs === "verifying" ? "checking" : "idle";
@@ -148,9 +150,14 @@ export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerif
             <Hex value={ballot.voterSignature} trim={26} />
           </div>
 
-          <div className="dim">wrAttestation</div>
+          <div className="dim">credential signature</div>
           <div>
-            <Hex value={ballot.wrAttestation} trim={26} />
+            {ballot.attestation ? <Hex value={ballot.attestation.signature} trim={26} /> : <span className="dim">—</span>}
+          </div>
+
+          <div className="dim">credential weight · nonce</div>
+          <div className="mono">
+            {ballot.attestation ? `${ballot.attestation.weight} · ${ballot.attestation.nonce}` : "—"}
           </div>
         </div>
       </div>
@@ -161,8 +168,8 @@ export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerif
           <p className="verifyYourselfDesc">
             {t("Don't trust this panel · re-run the same cryptographic check yourself, against this stage's on-chain data, on your own machine.")}
           </p>
-          <button type="button" className="verifyYourselfBtn" onClick={onVerifyLocally}>
-            {t("Open manual verification guide →")}
+          <button type="button" className="verifyYourselfBtn" onClick={onToggleGuide}>
+            {guideOpen ? t("Hide manual guide ↑") : t("Open manual verification guide →")}
           </button>
       </div>
     </div>

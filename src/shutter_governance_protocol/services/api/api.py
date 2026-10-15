@@ -248,7 +248,13 @@ def build_api_app(
         # metadata the port now carries is for tally/audit, and auditors read it through
         # the data-layer port, not this presentation surface.
         return _reply({
-            "ballots": [codecs.enc_ballot(sb.envelope) for sb in ballots],
+            # A malformed record keeps its slot, because the dashboard addresses ballots
+            # by position within the page.
+            "ballots": [
+                {"malformed": sb.malformed_reason} if sb.envelope is None
+                else codecs.enc_ballot(sb.envelope)
+                for sb in ballots
+            ],
             "total": total, "limit": limit, "offset": offset,
         })
 

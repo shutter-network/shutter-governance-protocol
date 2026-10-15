@@ -179,14 +179,19 @@ def port_read_blueprint(dl: ElectionDataLayer, *, name: str = "port_read",
         count = min(int(request.args.get("count", 0)), MAX_BALLOT_PAGE)
         # Storage metadata rides alongside the envelope, never inside it: the ballot
         # JSON is the voter-signed artifact and the conformance-vector surface.
-        return jsonify(ballots=[
-            {
-                "ballot": codecs.enc_ballot(sb.envelope),
+        # A record that could not be decoded is served as ``"ballot": null`` plus its
+        # reason, keeping its sequence number, so every reader excludes it the same way.
+        rows = []
+        for sb in dl.list_ballots(_eid(), start, count):
+            row = {
+                "ballot": None if sb.envelope is None else codecs.enc_ballot(sb.envelope),
                 "sequenceNumber": sb.sequence_number,
                 "submittedAt": sb.submitted_at,
             }
-            for sb in dl.list_ballots(_eid(), start, count)
-        ])
+            if sb.envelope is None:
+                row["malformed"] = sb.malformed_reason
+            rows.append(row)
+        return jsonify(ballots=rows)
 
     @bp.get("/elections/<eid>/ballots/count")
     def count_ballots(eid):

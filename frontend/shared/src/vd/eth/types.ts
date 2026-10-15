@@ -29,18 +29,35 @@ export type Ciphertext = {
   c2: Hex;
 };
 
+/** The eligibility credential a ballot carries (`ATTESTATION_V1`), as the issuer signed it.
+ *  Its fields are its own, not copies of the ballot's: verification checks that they
+ *  match the ballot. `weight` and `nonce` are decimal strings, so the object stays
+ *  JSON-serialisable for the downloadable fixtures and parses exactly with `BigInt`. */
+export type BallotAttestation = {
+  electionId: string; // decimal, as the API serves election ids
+  pseudonym: Hex; // bytes32
+  vk: Hex; // bytes48
+  weight: string;
+  nonce: string;
+  signature: Hex; // 80 bytes, R ‖ s
+};
+
 export type Ballot = {
   pseudonym: Hex; // bytes32
   vk: Hex; // bytes48
   ciphertexts: Ciphertext[]; // bytes96 each
   zkProof: Hex;
   voterSignature: Hex;
-  wrAttestation: Hex;
+  /** `null` only for a malformed record. */
+  attestation: BallotAttestation | null;
   nonce: number; // attestation re-vote nonce (last-wins ordering; 1 for a first vote)
   /** Eligibility weight this ballot is counted at. The tally multiplies the voter's points
    *  by it, so it is the difference between "80 points" and "6320 points" — but it was
    *  previously visible nowhere, leaving no way to confirm a ballot counted as intended. */
   weight: number;
+  /** Set when the stored record could not be decoded into a ballot (the API sends only
+   *  the reason). It is never counted; the other fields are empty placeholders. */
+  malformed?: string;
 };
 
 export type EncryptedTally = {
@@ -58,6 +75,8 @@ export type EncryptedTally = {
   totalScaledWeight: bigint;
   /** How many ballots the tally actually counted (after duplicates/invalid are excluded). */
   admittedCount: number;
+  /** Sequence numbers of the counted ballots, as the aggregate publishes them. */
+  admitted: number[];
 };
 
 export type DecryptionShare = {

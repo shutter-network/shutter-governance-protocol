@@ -134,11 +134,19 @@ class StoredBallot:
     out-of-band (direct SQL, a second writer, a restored backup) and makes the
     window publicly auditable — it does **not** defeat an operator who backdates.
     Only the chain's block time is adversarially authoritative.
+
+    ``envelope`` is ``None`` when the stored bytes cannot be decoded into a ballot, and
+    ``malformed_reason`` says why. This happens on the chain, whose contract stores the
+    credential as opaque bytes, so anyone can append one that is not a credential. The
+    record keeps its place in the order and admission excludes it as ``MALFORMED``.
+    Raising instead would make every read of the list fail, halting the tally and the
+    ingest filter for the rest of the election.
     """
 
     sequence_number: int
-    envelope: BallotEnvelope
+    envelope: BallotEnvelope | None
     submitted_at: int | None = None
+    malformed_reason: str | None = None
 
 
 @dataclass(frozen=True)

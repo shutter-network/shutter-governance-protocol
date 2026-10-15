@@ -59,6 +59,8 @@ def _max_stored_nonce(dl: ElectionDataLayer, election_id: bytes, pseudonym: byte
     while off >= floor and total:
         for sb in dl.list_ballots(election_id, off, min(_NONCE_SCAN_PAGE, total - off)):
             env = sb.envelope
+            if env is None:  # malformed record: it carries no nonce to compare
+                continue
             if env.pseudonym == pseudonym and env.attestation.nonce > best:
                 best = env.attestation.nonce
         if off == floor:

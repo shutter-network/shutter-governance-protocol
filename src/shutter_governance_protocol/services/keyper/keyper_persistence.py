@@ -47,6 +47,15 @@ def derive_fernet(signing_sk: int) -> Fernet:
 class DkgEntry:
     combined_share: int
     expires_at: int | None = None
+    # The key this share belongs to, fixed when round 2 completes. Publishing re-sends
+    # exactly this, so a retried or post-restart publish can never produce a different
+    # key: DKG votes are append-only per keyper, and a keyper that voted for one key and
+    # then derived another could never help finalize either.
+    pk_election: bytes | None = None
+    committee_pks: tuple[bytes, ...] | None = None
+    # Set once this keyper's vote for ``pk_election`` was accepted. From then on the
+    # keyper refuses to start a new ceremony for the election.
+    published: bool = False
 
     @property
     def public_key_share(self):
@@ -70,6 +79,11 @@ def save_dkg_secrets(fernet: Fernet, completed: dict[str, DkgEntry], state_dir: 
         row: dict = {"share": hex(entry.combined_share)}
         if entry.expires_at is not None:
             row["expires_at"] = entry.expires_at
+        if entry.pk_election is not None:
+            row["pk_election"] = entry.pk_election.hex()
+            row["committee_pks"] = [c.hex() for c in entry.committee_pks or ()]
+        if entry.published:
+            row["published"] = True
         data[eid] = row
     _write_atomic(_ensure(state_dir) / "dkg_secrets.enc", fernet.encrypt(json.dumps(data).encode()))
 
@@ -82,7 +96,13 @@ def load_dkg_secrets(fernet: Fernet, completed: dict[str, DkgEntry], state_dir: 
         data = json.loads(fernet.decrypt(path.read_bytes()))
         for eid, raw in data.items():
             exp = raw.get("expires_at")
-            completed[eid] = DkgEntry(int(raw["share"], 16), int(exp) if exp is not None else None)
+            pk = raw.get("pk_election")
+            completed[eid] = DkgEntry(
+                int(raw["share"], 16), int(exp) if exp is not None else None,
+                pk_election=bytes.fromhex(pk) if pk else None,
+                committee_pks=tuple(bytes.fromhex(c) for c in raw["committee_pks"]) if pk else None,
+                published=bool(raw.get("published", False)),
+            )
         logger.info("op=load_dkg_secrets status=ok elections=%d", len(data))
     except InvalidToken:
         logger.error("op=load_dkg_secrets status=error reason=decryption_failed (starting empty)")

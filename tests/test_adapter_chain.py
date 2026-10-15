@@ -442,3 +442,51 @@ def _b_result():
     from shutter_governance_protocol.envelopes.types import ResultArtifact
 
     return ResultArtifact(election_id=ELECTION_ID, totals=(1, 1, 1), keyper_indices=(1, 2), bsgs_bound=6)
+
+
+# --------------------------------------------------------------------------- #
+#  Undecodable ballot records (the contract stores wrAttestation as opaque bytes)
+# --------------------------------------------------------------------------- #
+
+def _poison(env, wr: bytes):
+    """Append, as an unprivileged account calling submitVote directly, a ballot whose
+    credential bytes are ``wr``. The contract checks only shapes, so it accepts them."""
+    from shutter_governance_protocol.adapters.chain import codec
+
+    good = codec.ballot_to_tuple(env.ballot(b"\x02" * 32))
+    out = env.dl("outsider")
+    out._send(out._election(ELECTION_ID).functions.submitVote((*good[:5], wr)))
+
+
+def _weight_zero_credential(env) -> bytes:
+    import json
+
+    from shutter_governance_protocol.adapters.chain import codec
+
+    d = json.loads(codec.ballot_to_tuple(env.ballot(b"\x02" * 32))[5])
+    d["weight"] = 0
+    return json.dumps(d).encode()
+
+
+@pytest.mark.parametrize("wr", [b"x", b"\xff", b"{}", b"[]", "weight0"],
+                         ids=["not-json", "not-utf8", "missing-fields", "wrong-shape", "weight-0"])
+def test_undecodable_credential_is_read_as_malformed(env, wr):
+    """One undecodable record used to make every read that included it raise, which
+    halted the keypers, the auditor and the ingest filter. It must read as a malformed
+    record in its own slot, with its neighbours intact."""
+    from shutter_governance_protocol.services.common.reads import read_all_ballots
+    from shutter_governance_protocol.services.gateway.gateway import _max_stored_nonce
+
+    env.register()
+    env.finalize_dkg()
+    env.warp(1100)
+    env.dl("gateway").submit_ballot(ELECTION_ID, env.ballot(b"\x01" * 32))
+    _poison(env, _weight_zero_credential(env) if wr == "weight0" else wr)
+
+    rows = read_all_ballots(env.reader(), ELECTION_ID)
+    assert [sb.sequence_number for sb in rows] == [0, 1]
+    assert rows[0].envelope is not None and rows[0].malformed_reason is None
+    assert rows[1].envelope is None and rows[1].malformed_reason
+    assert rows[1].submitted_at is not None
+    # The ingest filter keeps working for the next voter.
+    assert _max_stored_nonce(env.reader(), ELECTION_ID, b"\x03" * 32) == 0

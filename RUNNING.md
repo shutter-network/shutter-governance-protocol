@@ -357,6 +357,22 @@ can still publish if another keyper keeps complaining. The ceremony fails when
 no key finalises after repair; signed accusations are logged as `op=dkg_complaint`.
 An election without a finalised key at voting start derives to `DKGFailed`. The accused dealer's `/dkg/reveal_share` sends a replacement share sealed to the
 accusing recipient; the secret share is not returned to the coordinator.
+A share that never arrives counts as a bad share, so a dealer that withholds shares is
+accused and asked to re-send like any other. If a dispute survives the re-sends, the
+accused dealer must reveal the disputed share, signed, to the coordinator, which checks it
+against the dealer's commitments and forwards it to the accuser. A dealer that cannot
+produce a valid share is left out of the key (logged as `op=dkg phase=dispute`), so it
+cannot hold a veto over decryption. The coordinator sees only shares disputed this way. Before shares are sent, the coordinator
+also compares the commitments every keyper received. If one dealer signed two different
+sets, both signed sets are logged as `op=dkg_equivocation` and that dealer is left out of
+the key: every keyper checks the signatures itself, then builds its share and the key from
+the remaining dealers. The excluded keyper stays a committee member and can still decrypt.
+The ceremony stops only if fewer than `t` dealers would remain.
+A keyper never publishes a key unless its own share matches it.
+If publishing is interrupted after any keyper has voted, the coordinator resumes: the
+remaining keypers publish the key they saved at round 2, instead of starting a new
+ceremony that would produce a different key. Keypers keep that key with their secret
+share, so this also works after a keyper restart.
 
 **Tally ordering & bounds.** The tally runs in strict order and only after `voting_end`, enforced at
 every layer: the coordinator drives it only in the `Tallying` state, keypers self-guard, and the data

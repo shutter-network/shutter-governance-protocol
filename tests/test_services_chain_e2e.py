@@ -169,3 +169,38 @@ def test_full_weighted_election_over_chain(anvil_w3):
     from shutter_governance_protocol.adapters.chain.client import BlockchainDataLayer
     fresh = BlockchainDataLayer(anvil_w3, world.registry, world.signers["admin"].account)
     assert list(fresh.get_result(ELECTION_ID).totals) == [6, 15, 0]
+
+
+def test_tally_completes_despite_an_undecodable_ballot_on_chain(anvil_w3):
+    """An outsider stores a ballot whose credential bytes are not a credential. Voting
+    through the gateway must continue after it, and the tally must exclude it as
+    MALFORMED and count everyone else."""
+    from shutter_governance_protocol.adapters.chain import codec
+    from shutter_governance_protocol.adapters.chain.client import BlockchainDataLayer
+    from shutter_governance_protocol.envelopes.types import ExclusionReason
+    from eth_account import Account
+
+    world = ChainWorld(anvil_w3)
+    admin.register_election(world.admin_dl, world.config, world.admin_signer.sign_register(world.config),
+                            admin_identity=world.admin_signer.identity, clock=world.clock, dkg_lead_time=DKG_LEAD_TIME)
+    assert coord.ensure_dkg(
+        ELECTION_ID, world.keypers, world.admin_dl, n=world.n, t=world.t,
+        clock=world.clock, deadline=world.config.voting_start,
+    )
+
+    world.warp(1500)
+    submit_ballot(world.gateway_dl, ELECTION_ID, world.voter_ballot([3, 0, 0], b"\x01" * 32, weight=2), clock=world.clock)
+    # The attack: a direct submitVote (fee 0 here) from an account with no role.
+    outsider = BlockchainDataLayer(anvil_w3, world.registry, Account.from_key(ANVIL_KEYS[6]))
+    good = codec.ballot_to_tuple(world.voter_ballot([0, 0, 3], b"\x09" * 32))
+    outsider._send(outsider._election(ELECTION_ID).functions.submitVote((*good[:5], b"x")))
+    # Voting through the gateway still works after it.
+    submit_ballot(world.gateway_dl, ELECTION_ID, world.voter_ballot([0, 3, 0], b"\x02" * 32, weight=5), clock=world.clock)
+    assert world.admin_dl.count_ballots(ELECTION_ID) == 3
+
+    world.warp(2500)
+    result = agg.run_tally(world.result_publisher_dl, ELECTION_ID, world.result_publisher_signer, world.keypers, clock=world.clock)
+    assert result is not None
+    assert list(result.totals) == [6, 15, 0]
+    aggregate = world.admin_dl.get_aggregate(ELECTION_ID)
+    assert [(x.sequence_number, x.reason) for x in aggregate.exclusions] == [(1, ExclusionReason.MALFORMED)]

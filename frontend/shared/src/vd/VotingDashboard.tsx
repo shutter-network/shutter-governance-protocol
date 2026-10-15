@@ -192,13 +192,14 @@ function computeBallotDedup(all: Ballot[]): BallotDedup {
   const winnerIdx = new Map<string, number>(); // pseudonym -> winning (highest-nonce) index
   const seen = new Map<string, number>();        // pseudonym -> occurrence count
   all.forEach((b, i) => {
+    if (b.malformed !== undefined) return; // never counted, and has no real pseudonym
     seen.set(b.pseudonym, (seen.get(b.pseudonym) ?? 0) + 1);
     const cur = winnerIdx.get(b.pseudonym);
     // last-wins by (nonce, index): higher nonce wins; equal nonce → later index.
     if (cur === undefined || b.nonce >= all[cur].nonce) winnerIdx.set(b.pseudonym, i);
   });
   const superseded = new Set<number>();
-  all.forEach((_b, i) => { if (winnerIdx.get(all[i].pseudonym) !== i) superseded.add(i); });
+  all.forEach((b, i) => { if (b.malformed === undefined && winnerIdx.get(b.pseudonym) !== i) superseded.add(i); });
   const revoted = new Set<string>();
   seen.forEach((n, p) => { if (n > 1) revoted.add(p); });
   return { superseded, revoted, counted: winnerIdx.size };
@@ -344,7 +345,7 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
     try {
       const total = Number(overviewBallotTotal); const PAGE = 50; const all: Ballot[] = [];
       for (let off = 0; off < total; off += PAGE) { const { ballots: pg } = await fetchBallotsPage(electionId, off, PAGE); all.push(...pg); }
-      const fixture = { electionId: overview.config.electionId.toString(), numCandidates: overview.config.numCandidates, budget: overview.config.budget, mpkElectionG2: overview.dkg.pkElection, pkWrG1: overview.config.pkWR, aggregate: aggregate.aggregates, ballots: all, exportedAt: new Date().toISOString() };
+      const fixture = { electionId: overview.config.electionId.toString(), numCandidates: overview.config.numCandidates, budget: overview.config.budget, mode: overview.config.mode, variant: overview.config.variant, scale: overview.config.scale, mpkElectionG2: overview.dkg.pkElection, pkWrG1: overview.config.pkWR, aggregate: aggregate.aggregates, admitted: aggregate.admitted, ballots: all, exportedAt: new Date().toISOString() };
       const blob = new Blob([JSON.stringify(fixture, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = "aggregate-fixture.json"; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
     } finally { setDownloadingAggFixture(false); }
@@ -412,7 +413,7 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
   const verifyCfg = () => ({
     electionId: overview!.config.electionId, numCandidates: overview!.config.numCandidates,
     budget: overview!.config.budget, mode: overview!.config.mode, variant: overview!.config.variant,
-    pkWR: overview!.config.pkWR,
+    pkWR: overview!.config.pkWR, scale: overview!.config.scale,
   });
   async function runBallotVerify(b: Ballot, gi: number) {
     setBallotVerify((m) => ({ ...m, [gi]: { status: "verifying" } }));
@@ -690,7 +691,11 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
                                 <div className="blRowIndex"><div className="blRowIndexLabel">index {globalIndex}</div></div>
                                 <div className="blRowPseudonym"><span className="blRowPseudonymLabel dim">pseudonym</span><span className="blRowPseudonymGroup"><span className="mono"><Hex value={b.pseudonym} trim={14} copyable={false} /></span><span onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}><CopyTextButton text={b.pseudonym} ariaLabel={t("Copy pseudonym")} /></span></span></div>
                                 <div className="blRowStatus">
-                                  {isSuperseded ? (
+                                  {b.malformed !== undefined ? (
+                                    <span className="tip tip--end" data-tip={t("This record could not be read as a ballot — not counted")}>
+                                      <span className="blBadge blBadge--superseded">{t("malformed")}</span>
+                                    </span>
+                                  ) : isSuperseded ? (
                                     <span className="tip tip--end" data-tip={t("A later ballot from this wallet replaced it — not counted")}>
                                       <span className="blBadge blBadge--superseded">{t("superseded")}</span>
                                     </span>
@@ -707,7 +712,7 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
                         <p className="blHelpText">Click any ballot to see its cryptographic details (ciphertexts, ZK proof, voter signature, attestation).</p>
                       </>
                     ) : !isTriple ? (
-                      <BallotDetail ballot={detailBallot!} globalIndex={detailView!.globalIndex} verifyState={{ ...(ballotVerify[detailView!.globalIndex] ?? { status: "idle" }), token: 0 } as any} onBack={() => { setDetailView(null); setShowVerifyPanel(false); }} onVerifyLocally={() => void runBallotVerify(detailBallot!, detailView!.globalIndex)} txHash={null} explorerUrl={undefined} />
+                      <BallotDetail ballot={detailBallot!} globalIndex={detailView!.globalIndex} verifyState={{ ...(ballotVerify[detailView!.globalIndex] ?? { status: "idle" }), token: 0 } as any} onBack={() => { setDetailView(null); setShowVerifyPanel(false); }} onVerifyLocally={() => void runBallotVerify(detailBallot!, detailView!.globalIndex)} onToggleGuide={() => setShowVerifyPanel((open) => !open)} guideOpen={showVerifyPanel} txHash={null} explorerUrl={undefined} />
                     ) : null}
                   </div>
                 )}

@@ -40,3 +40,25 @@ def test_malformed_value_raises_rather_than_retaining_forever():
     """Silently falling back to indefinite retention is the failure mode being closed."""
     with pytest.raises(ValueError):
         _parse_secret_ttl("90d")
+
+
+def test_dkg_entry_round_trips_its_key_and_published_flag(tmp_path):
+    """The key fixed at round 2 and the published flag survive a restart. Entries written
+    before these fields existed still load, with no key and not published."""
+    import json
+    import logging
+
+    from shutter_governance_protocol.services.keyper import keyper_persistence as persist
+
+    fernet = persist.derive_fernet(0x1234)
+    entry = persist.DkgEntry(5, 99, pk_election=b"\x01" * 96, committee_pks=(b"\x02" * 96, b"\x03" * 96),
+                             published=True)
+    persist.save_dkg_secrets(fernet, {"aa": entry}, tmp_path)
+    loaded: dict = {}
+    persist.load_dkg_secrets(fernet, loaded, tmp_path, logging.getLogger("t"))
+    assert loaded["aa"] == entry
+
+    (tmp_path / "dkg_secrets.enc").write_bytes(fernet.encrypt(json.dumps({"bb": {"share": "0x7"}}).encode()))
+    old: dict = {}
+    persist.load_dkg_secrets(fernet, old, tmp_path, logging.getLogger("t"))
+    assert old["bb"] == persist.DkgEntry(7)

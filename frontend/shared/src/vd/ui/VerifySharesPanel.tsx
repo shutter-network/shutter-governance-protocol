@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import type { DecryptionShare, EncryptedTally, ElectionConfigView, DkgResultView } from "../eth/types";
 import { CodeBlock } from "./CodeBlock";
 
-const SDK_PACKAGE = "@shutter-network/urban-verified-crypto";
+import { SDK_PACKAGE, SDK_VERSION } from "./sdk";
 
 type Props = {
   overview: { config: ElectionConfigView; dkg: DkgResultView };
@@ -42,7 +42,7 @@ export function VerifySharesPanel({ overview, aggregate, shares, selectedElectio
     URL.revokeObjectURL(url);
   }
 
-  const installCmd = `npm install ${SDK_PACKAGE}`;
+  const installCmd = `npm install ${SDK_PACKAGE}@${SDK_VERSION}`;
 
   const scriptCode = [
     `const { initCurves, G2Point, Transcript, verifyDecryptionShare } = require("${SDK_PACKAGE}");`,
@@ -57,13 +57,14 @@ export function VerifySharesPanel({ overview, aggregate, shares, selectedElectio
     `  const electionIdBytes = electionId32(f.electionId);`,
     `  let ok = true;`,
     `  for (const s of f.shares) {`,
-    `    const memberIndex = s.keyperIndex, pk = g2FromHex(f.committeePks[memberIndex]);`,
+    `    // keyperIndex is 1-based; committeePks is indexed from 0.`,
+    `    const pk = g2FromHex(f.committeePks[s.keyperIndex - 1]);`,
     `    for (let j = 0; j < f.numCandidates; j++) {`,
     `      const ct = { c1: g2FromHex(f.aggregate[j].c1), c2: g2FromHex(f.aggregate[j].c2) };`,
-    `      const share = { keyperIndex: memberIndex + 1, sigma: g2FromHex(s.shares[j]), proof: { e: BigInt(s.proofs[j].e), z: BigInt(s.proofs[j].z) } };`,
+    `      const share = { keyperIndex: s.keyperIndex, sigma: g2FromHex(s.shares[j]), proof: { e: BigInt(s.proofs[j].e), z: BigInt(s.proofs[j].z) } };`,
     `      const valid = verifyDecryptionShare(ct, share, pk, decryptTranscript(electionIdBytes, j));`,
     `      if (!valid) ok = false;`,
-    `      console.log(\`Keyper \${memberIndex}, candidate \${j}: \${valid ? "✓ valid" : "✗ invalid"}\`);`,
+    `      console.log(\`Keyper \${s.keyperIndex}, candidate \${j}: \${valid ? "✓ valid" : "✗ invalid"}\`);`,
     `    }`,
     `  }`,
     `  console.log(ok ? "\\n✓ All shares verified" : "\\n✗ Invalid shares detected");`,

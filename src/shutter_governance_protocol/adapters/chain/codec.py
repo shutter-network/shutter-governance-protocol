@@ -86,10 +86,17 @@ def ballot_record_from_contract(raw, election_id: bytes, sequence_number: int) -
     only backend whose clock the data-layer operator does not control.
     """
     ballot, submitted_at = raw[0], raw[1]
+    # ``wrAttestation`` is opaque to the contract, so any non-empty bytes are stored.
+    # Bytes that are not a credential must not make the read fail; see StoredBallot.
+    try:
+        envelope, reason = ballot_from_contract(ballot, election_id), None
+    except codecs.BALLOT_DECODE_ERRORS as exc:
+        envelope, reason = None, f"{type(exc).__name__}: {exc}"
     return StoredBallot(
         sequence_number=sequence_number,
-        envelope=ballot_from_contract(ballot, election_id),
+        envelope=envelope,
         submitted_at=int(submitted_at),
+        malformed_reason=reason,
     )
 
 

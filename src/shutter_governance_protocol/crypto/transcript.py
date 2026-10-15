@@ -13,6 +13,7 @@ from __future__ import annotations
 from eth_utils import keccak
 
 from shutter_governance_protocol.crypto.params import (
+    CURVE_ORDER,
     DST_FIAT_SHAMIR,
     scalar_to_bytes,
     u32be,
@@ -44,6 +45,12 @@ class Transcript:
         self.append(tag, g2_to_compressed(point))
 
     def append_scalar(self, tag: str, s: int) -> None:
+        # Reject rather than reduce, as the SDK's ``appendScalar`` does. Reducing would
+        # make ``s`` and ``s + CURVE_ORDER`` hash identically, so a signature over one
+        # would also verify the other. An attestation's weight and nonce are used as raw
+        # integers after verification, so that gap let a voter inflate them.
+        if not (0 <= s < CURVE_ORDER):
+            raise ValueError(f"{tag}: scalar out of range [0, CURVE_ORDER)")
         self.append(tag, scalar_to_bytes(s))
 
     def challenge(self, tag: str) -> int:

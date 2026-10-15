@@ -55,6 +55,16 @@ class DKGComplaint(DKGError):
         self.accusations = accusations
 
 
+class DKGEquivocation(DKGComplaint):
+    """Dealers signed different commitment vectors for different keypers, and excluding
+    them would leave fewer dealers than the threshold. (A smaller number is excluded and
+    the ceremony continues.) Carries the signed vectors as ``evidence``."""
+
+    def __init__(self, message: str, evidence: list[dict]):
+        super().__init__(message, [])
+        self.evidence = evidence
+
+
 def keyper_urls_from(config, overrides: dict[str, str] | None = None) -> dict[int, str]:
     """Map keyper index (1-based) → HTTP URL for the ceremony/trigger.
 
@@ -272,17 +282,18 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
     returns its token; used to recover a phase call that comes back ``401``."""
     eid_hex = election_id.hex()
 
-    def call(i: int, phase: str):
+    def call(i: int, phase: str, extra: dict | None = None):
         path = "/dkg/" + phase
+        body = {"electionId": eid_hex, **(extra or {})}
         try:
-            r = requests.post(keyper_urls[i].rstrip("/") + path, json={"electionId": eid_hex},
+            r = requests.post(keyper_urls[i].rstrip("/") + path, json=body,
                               headers={"Authorization": f"Bearer {api_tokens[i]}"}, timeout=timeout)
             if r.status_code == 401 and rebootstrap is not None:
                 _LOG.info("op=dkg phase=%s keyper=%d status=reauth election=%s", phase, i, eid_hex)
                 token = rebootstrap(i)
                 if token:
                     api_tokens[i] = token
-                    r = requests.post(keyper_urls[i].rstrip("/") + path, json={"electionId": eid_hex},
+                    r = requests.post(keyper_urls[i].rstrip("/") + path, json=body,
                                       headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
             r.raise_for_status()
             return r.json()
@@ -291,18 +302,63 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
             raise
 
     idxs = sorted(keyper_urls)
-    for phase in ("round1", "distribute_commitments", "distribute_shares"):
+
+    # Resume, never restart, once any keyper has voted. A new round 1 would give every
+    # keyper a fresh polynomial and so a different key, but DKG votes are append-only per
+    # keyper: those who already voted could never vote for the new key, and their secret
+    # for the old one would be gone. Each keyper keeps the key it fixed at round 2, so
+    # asking the rest to publish completes the original key. (A failure before anyone
+    # published leaves no vote, and the full ceremony below is safe to rerun.)
+    if data_layer.get_dkg_submissions(election_id):
+        _LOG.info("op=dkg status=resuming election=%s reason=votes_already_published", eid_hex)
+        for i in idxs:
+            try:
+                call(i, "publish")
+            except Exception:  # noqa: BLE001 — logged by call(); retried on the next attempt
+                pass
+        finalized = data_layer.get_finalized_key(election_id) is not None
+        _LOG.log(logging.INFO if finalized else logging.WARNING,
+                 "op=dkg status=%s election=%s", "finalized" if finalized else "resume_incomplete", eid_hex)
+        return finalized
+
+    for phase in ("round1", "distribute_commitments"):
         for i in idxs:
             call(i, phase)
         _LOG.info("op=dkg phase=%s status=ok election=%s keypers=%d", phase, eid_hex, len(idxs))
 
+    # Each keyper checks shares only against the commitments *it* received, so a dealer
+    # that sends one set to some keypers and another set to the rest passes every check.
+    # The key then finalizes from one set, and the keypers holding the other set can
+    # never decrypt. Compare every keyper's copy before any share is sent; a dealer
+    # caught signing two sets is left out of the key, with the proof attached so each
+    # keyper can check it.
+    config_cache: list = []
+
+    def config():
+        if not config_cache:
+            config_cache.append(data_layer.get_election(election_id).config)
+        return config_cache[0]
+
+    exclusions, agreed = _equivocation_exclusions(election_id, idxs, call, data_layer)
+    remaining = len(idxs) - len(exclusions)
+    if exclusions and remaining < config().threshold.quorum:
+        raise DKGEquivocation(
+            f"DKG halted: dealer(s) {[x['dealer'] for x in exclusions]} signed different commitments, "
+            f"and excluding them would leave fewer dealers than the threshold.",
+            [rep for x in exclusions for rep in x["evidence"]])
+    round2_body = {"excluded": exclusions} if exclusions else None
+
+    for i in idxs:
+        call(i, "distribute_shares")
+    _LOG.info("op=dkg phase=distribute_shares status=ok election=%s keypers=%d", eid_hex, len(idxs))
+
     # round2 — collect complaints. A verified:false response carries recipient-signed
     # accusations (DKG-ACCUSE-v1).
-    def round2_complaints(targets):
+    def round2_complaints(targets, body_for=lambda _i: round2_body):
         """Run round 2 on `targets`; return {accuser: [accusation, ...]} for the failures."""
         out = {}
         for i in targets:
-            resp = call(i, "round2")
+            resp = call(i, "round2", body_for(i))
             if isinstance(resp, dict) and resp.get("verified") is False:
                 out[i] = resp.get("accusations", [])
         return out
@@ -335,6 +391,47 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
         complaints = round2_complaints(sorted(complaints))
         _LOG.info("op=dkg phase=repair status=rechecked election=%s attempt=%d still_complaining=%d",
                   eid_hex, attempts, len(complaints))
+
+    if complaints:
+        # Settle what the sealed re-send did not. The accused dealer must now hand the
+        # disputed share, signed, to this coordinator, which checks it against the dealer's
+        # agreed commitments. A valid share goes to the accuser; a dealer that cannot
+        # produce one is excluded from the key. Without this, a dealer withholding one
+        # recipient's share and refusing to repair kept a veto over decryption, and a
+        # counter-accusation made the two sides indistinguishable.
+        #
+        # The coordinator learns that one share. Only the accuser was entitled to it: if
+        # the accuser lied, it already held the share; if the dealer lied, its secret
+        # does not matter. It discloses anything new only when both are honest and the
+        # sealed re-send kept failing. Each reveal needs that share's own recipient's
+        # signed accusation, so a coordinator cannot gather enough shares of one dealer's
+        # polynomial without colluding with a quorum of keypers.
+        revealed: dict[int, list[dict]] = {}
+        newly_excluded: dict[int, dict] = {}
+        already = {x["dealer"] for x in exclusions}
+        for accuser, accusations in sorted(complaints.items()):
+            for acc in accusations:
+                dealer = acc.get("accusedDealerIndex")
+                if dealer not in keyper_urls or dealer in already or dealer in newly_excluded \
+                        or acc.get("recipientIndex") != accuser:
+                    continue
+                share = _public_reveal(election_id, keyper_urls[dealer], api_tokens, dealer, accuser, acc,
+                                       agreed.get(dealer), config(), rebootstrap=rebootstrap, timeout=timeout)
+                if share is not None:
+                    revealed.setdefault(accuser, []).append(share)
+                else:
+                    newly_excluded[dealer] = {"dealer": dealer, "reason": "no_valid_reveal", "accusation": acc}
+        if len(idxs) - len(exclusions) - len(newly_excluded) < config().threshold.quorum:
+            _LOG.error("op=dkg phase=dispute status=cannot_exclude election=%s dealers=%s "
+                       "reason=fewer_than_threshold_would_remain", eid_hex, sorted(newly_excluded))
+            newly_excluded = {}
+        if revealed or newly_excluded:
+            exclusions = exclusions + list(newly_excluded.values())
+            _LOG.warning("op=dkg phase=dispute status=settled election=%s revealed_for=%s excluded=%s",
+                         eid_hex, sorted(revealed), sorted(newly_excluded))
+            # Everyone re-runs round 2: an exclusion changes every keyper's share and key.
+            complaints = round2_complaints(
+                idxs, lambda i: {"excluded": exclusions, **({"revealed": revealed[i]} if i in revealed else {})})
 
     if complaints:
         # Every accusation was given its repair attempt and some keyper still cannot verify.
@@ -373,6 +470,97 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
             f"fewer than the quorum able to publish. Signed accusations logged above.",
             accusations)
     return finalized
+
+
+def _equivocation_exclusions(election_id: bytes, idxs, call, data_layer: ElectionDataLayer):
+    """Find dealers that signed two different commitment vectors.
+
+    Returns ``(exclusions, agreed)``: the exclusions for the equivocating dealers, and,
+    for every other dealer, the one commitment vector (hex) the keypers agree on, which
+    a publicly revealed share is later checked against.
+
+    Each exclusion is ``{"dealer", "reason": "equivocation", "evidence": [report, ...]}``,
+    the form ``/dkg/round2`` verifies. Only dealer-signed vectors count, so a keyper
+    cannot frame an honest dealer by reporting a vector the dealer never signed; such a
+    report is logged and ignored. A keyper that holds no vector for some dealer is left
+    to round 2, which complains about it.
+    """
+    from shutter_governance_protocol.core import write_auth
+
+    eid_hex = election_id.hex()
+    members: dict[int, bytes] | None = None  # committee addresses, read on first use
+    seen: dict[int, dict[tuple[bytes, ...], dict]] = {}  # dealer -> {vector: first report}
+    for i in idxs:
+        held = call(i, "commitments").get("commitments", {})
+        if held and members is None:
+            members = {j: bytes(k.signing_key)
+                       for j, k in enumerate(data_layer.get_election(election_id).config.keypers, start=1)}
+        for dealer_s, row in held.items():
+            dealer = int(dealer_s)
+            try:
+                vector = tuple(bytes.fromhex(h) for h in row["commitments"])
+                sig = bytes.fromhex(str(row["signature"]).removeprefix("0x"))
+                signed = write_auth.recover_digest(
+                    write_auth.dkg_commitments_digest(election_id, dealer, list(vector)), sig) == members.get(dealer)
+            except Exception:  # noqa: BLE001 — malformed report: treated as unsigned
+                signed = False
+            if not signed:
+                _LOG.warning("op=dkg phase=check_commitments status=ignored election=%s reporter=%d dealer=%d "
+                             "reason=not_signed_by_dealer", eid_hex, i, dealer)
+                continue
+            seen.setdefault(dealer, {}).setdefault(
+                vector, {"reporter": i, "dealer": dealer, "commitments": row["commitments"],
+                         "signature": row["signature"]})
+    exclusions = []
+    for dealer in sorted(d for d, vectors in seen.items() if len(vectors) > 1):
+        evidence = list(seen[dealer].values())
+        for rep in evidence:
+            _LOG.error("op=dkg_equivocation election=%s dealer=%d reporter=%d signature=%s",
+                       eid_hex, dealer, rep["reporter"], rep["signature"])
+        exclusions.append({"dealer": dealer, "reason": "equivocation", "evidence": evidence})
+    _LOG.log(logging.WARNING if exclusions else logging.INFO,
+             "op=dkg phase=check_commitments status=%s election=%s dealers=%d excluded=%s",
+             "excluding" if exclusions else "ok", eid_hex, len(seen), [x["dealer"] for x in exclusions])
+    agreed = {d: next(iter(v.values()))["commitments"] for d, v in seen.items() if len(v) == 1}
+    return exclusions, agreed
+
+
+def _public_reveal(election_id: bytes, url: str, api_tokens, dealer: int, accuser: int, accusation: dict,
+                   vector, config, *, rebootstrap, timeout: float) -> dict | None:
+    """Ask ``dealer`` for the share it owes ``accuser``, signed; return it if it checks out.
+
+    Returns ``{"dealer", "share", "signature"}`` for the accuser's round 2, or ``None``
+    when the dealer refused, was unreachable, or produced a share that does not match its
+    signature or its agreed commitments; the caller then excludes the dealer.
+    """
+    from shutter_governance_protocol.core import write_auth
+    from shutter_governance_protocol.crypto.dkg import verify_share
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+    from shutter_governance_protocol.crypto.points import g2_from_compressed
+
+    eid_hex = election_id.hex()
+    resp = _post_keyper(url, "/dkg/reveal_share", election_id, api_tokens, dealer, rebootstrap=rebootstrap,
+                        timeout=timeout, op="reveal_public", extra={"accusation": accusation, "public": True})
+    try:
+        if resp is None or resp.status_code != 200 or vector is None:
+            raise ValueError("no reveal" if vector is not None else "no agreed commitments")
+        data = resp.json()
+        share = int(str(data["share"]), 16)
+        sig = bytes.fromhex(str(data["signature"]).removeprefix("0x"))
+        dealer_addr = bytes(config.keypers[dealer - 1].signing_key)
+        if not 0 <= share < CURVE_ORDER:
+            raise ValueError("share out of range")
+        if write_auth.recover_digest(write_auth.dkg_share_digest(election_id, dealer, accuser, share), sig) != dealer_addr:
+            raise ValueError("not signed by the dealer")
+        if not verify_share([g2_from_compressed(bytes.fromhex(h)) for h in vector], accuser, share):
+            raise ValueError("does not match the dealer's commitments")
+    except Exception as err:  # noqa: BLE001 — any failure means the dealer did not clear itself
+        _LOG.error("op=dkg phase=dispute status=dealer_failed election=%s dealer=%d accuser=%d reason=%s",
+                   eid_hex, dealer, accuser, err)
+        return None
+    _LOG.warning("op=dkg phase=dispute status=dealer_cleared election=%s dealer=%d accuser=%d",
+                 eid_hex, dealer, accuser)
+    return {"dealer": dealer, "share": hex(share), "signature": "0x" + sig.hex()}
 
 
 def trigger_decrypt_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: dict[int, str],

@@ -378,8 +378,13 @@ def verify_ballot_crypto(*, mpk, election_id: bytes, pseudonym: bytes, vk_bytes:
         R, s = schnorr.decode(voter_signature)
     except Exception:  # noqa: BLE001
         return False, "MALFORMED"
-    preimage = canonical_ballot_message(election_id, pseudonym, ciphertext_bytes, zk_proof,
-                                       attestation)
+    # Stored ballots are untrusted, so a credential that cannot be encoded (a weight or
+    # nonce too large for its 32-byte field) must be excluded, not crash the tally.
+    try:
+        preimage = canonical_ballot_message(election_id, pseudonym, ciphertext_bytes, zk_proof,
+                                           attestation)
+    except (ValueError, OverflowError):
+        return False, "MALFORMED"
     if not schnorr.verify(vk, keccak(preimage), R, s):
         # Name a format mismatch as one. A v1 signature does not fail informatively
         # against v2 -- ``schnorr.verify`` just returns False, which reads as "wrong

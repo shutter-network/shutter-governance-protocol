@@ -57,6 +57,9 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
     :class:`ExclusionReason`. ``mpk`` is a decoded G2 point.
     """
     env = sb.envelope
+    # Stored, but not decodable into a ballot (see StoredBallot).
+    if env is None:
+        return ExclusionReason.MALFORMED
     att = env.attestation
 
     # Wrong-election binding / structural mismatch.

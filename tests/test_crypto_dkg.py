@@ -229,3 +229,59 @@ def test_derive_helpers_reject_wrong_length():
         with pytest.raises(ValueError) as ei:
             call()
         assert ei.value.bad_dealers == [2]
+
+
+def test_round2_flags_a_dealer_whose_share_never_arrived():
+    """A dealer that published commitments but withheld this keyper's share used to be
+    skipped silently, leaving a secret that does not match the published key."""
+    import pytest
+
+    from shutter_governance_protocol.crypto.dkg import KeyperDKGState
+
+    states = {i: KeyperDKGState() for i in (1, 2, 3)}
+    comms, shares = {}, {}
+    for i, st in states.items():
+        comms[i], shares[i] = st.round1(i, 3, 2)
+    received = {1: shares[1][1], 2: shares[2][1]}  # dealer 3 withheld keyper 1's share
+    with pytest.raises(ValueError) as ei:
+        states[1].round2(comms, received)
+    assert ei.value.bad_dealers == [3]
+
+
+def test_excluding_an_equivocating_dealer_restores_every_share():
+    """Dealer 3 deals polynomial A to keypers 1 and 3 and a different polynomial B to
+    keyper 2. Every Feldman check passes, yet keyper 2's share does not fit the key built
+    from A. Dropping dealer 3 from both the shares and the key makes all three fit."""
+    from shutter_governance_protocol.crypto.dkg import (
+        KeyperDKGState,
+        committee_keys,
+        derive_joint_mpk,
+        qualified,
+    )
+    from shutter_governance_protocol.crypto.points import G2, eq, mul
+
+    st = {i: KeyperDKGState() for i in (1, 2, 3)}
+    c, s = {}, {}
+    for i in (1, 2):
+        c[i], s[i] = st[i].round1(i, 3, 2)
+    cA, sA = st[3].round1(3, 3, 2)
+    cB, sB = KeyperDKGState().round1(3, 3, 2)
+    view = {1: {1: c[1], 2: c[2], 3: cA}, 2: {1: c[1], 2: c[2], 3: cB}, 3: {1: c[1], 2: c[2], 3: cA}}
+    got = {1: {1: s[1][1], 2: s[2][1], 3: sA[1]}, 2: {1: s[1][2], 2: s[2][2], 3: sB[2]},
+           3: {1: s[1][3], 2: s[2][3], 3: sA[3]}}
+
+    # Without exclusion: no complaint, but keyper 2 cannot decrypt under key A.
+    for i in (1, 2, 3):
+        st[i].round2(view[i], got[i])
+    keys_a = committee_keys(3, view[1], 2)
+    assert not eq(keys_a[1], mul(G2, st[2].combined_share))
+
+    # With dealer 3 excluded everywhere, every view yields the same key and every share fits.
+    for i in (1, 2, 3):
+        st[i].round2(view[i], got[i], dealers=[1, 2])
+    pks = {i: derive_joint_mpk(qualified(view[i], {3}), 2) for i in (1, 2, 3)}
+    assert eq(pks[1], pks[2]) and eq(pks[1], pks[3])
+    keys = committee_keys(3, qualified(view[1], {3}), 2)
+    assert len(keys) == 3
+    for i in (1, 2, 3):
+        assert eq(keys[i - 1], mul(G2, st[i].combined_share))

@@ -190,3 +190,117 @@ def test_admission_is_deterministic(env):
     r2 = admit(ballots, cfg, env.mpk_bytes)
     assert [a.sequence_number for a in r1.admitted] == [a.sequence_number for a in r2.admitted]
     assert r1.exclusions == r2.exclusions
+
+
+# --------------------------------------------------------------------------- #
+#  Non-canonical weight / nonce (credential value >= q)
+# --------------------------------------------------------------------------- #
+
+def _self_signed(env, votes, pseudonym, *, weight=1, nonce=1, claimed_weight=None, claimed_nonce=None):
+    """A voter holding a genuine (weight, nonce) credential edits it, then signs the
+    ballot over the edited credential with their own key, as a real attacker would."""
+    from shutter_governance_protocol.crypto import attestation as att_crypto
+    from shutter_governance_protocol.crypto import ballot as ballot_crypto
+    from shutter_governance_protocol.crypto import schnorr
+    from shutter_governance_protocol.crypto.points import g1_to_compressed
+    from shutter_governance_protocol.envelopes.types import BallotEnvelope, Ciphertext
+
+    sk, vk = schnorr.keygen()
+    vk_bytes = g1_to_compressed(vk)
+    _, elig_vk = schnorr.keygen(env.elig_sk)
+    sig = att_crypto.sign_attestation(env.elig_sk, elig_vk, env_eid(env), pseudonym, vk_bytes, weight, nonce)
+    att = Attestation(
+        election_id=env_eid(env), pseudonym=pseudonym, vk=vk_bytes,
+        weight=weight if claimed_weight is None else claimed_weight,
+        signature=sig, nonce=nonce if claimed_nonce is None else claimed_nonce,
+    )
+    built = ballot_crypto.build_ballot(
+        mpk=env.mpk_point, election_id=env_eid(env), pseudonym=pseudonym, sk=sk, vk=vk,
+        attestation=att, votes=votes, num_candidates=len(votes), budget=3,
+    )
+    return BallotEnvelope(
+        election_id=env_eid(env), pseudonym=pseudonym, vk=vk_bytes,
+        ciphertexts=tuple(Ciphertext(c1=a, c2=b) for (a, b) in built.ciphertexts),
+        zk_proof=built.zk_proof, voter_signature=built.voter_signature, attestation=att,
+    )
+
+
+def env_eid(env):
+    return env.config().election_id
+
+
+def test_voter_cannot_inflate_own_weight_by_curve_order(env):
+    """Weight 1 signed, ``1 + q`` claimed and voter-signed: excluded, and the total weight
+    (hence the BSGS bound) stays honest, so the tally remains solvable."""
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+
+    cfg = env.config()
+    bad = _self_signed(env, [3, 0, 0], P1, weight=1, claimed_weight=1 + CURVE_ORDER)
+    ok = _stored(env, 1, [0, 3, 0], P2)
+    res = admit([StoredBallot(0, bad), ok], cfg, env.mpk_bytes)
+    assert [a.sequence_number for a in res.admitted] == [1]
+    assert res.exclusions[0].reason is ExclusionReason.INVALID_ATTESTATION
+    assert res.total_admitted_weight == 1
+
+
+def test_oversized_weight_on_stored_ballot_is_excluded_not_a_crash(env):
+    """Anyone who can store a ballot sets weight to ``w + 3q`` (> 2^256), no re-signing.
+    It used to raise OverflowError out of admit() and halt every keyper."""
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+
+    cfg = env.config()
+    good = env.ballot([1, 0, 2], P1)
+    bad = replace(good, attestation=replace(good.attestation, weight=1 + 3 * CURVE_ORDER))
+    res = admit([StoredBallot(0, bad), _stored(env, 1, [0, 3, 0], P2)], cfg, env.mpk_bytes)
+    assert [a.sequence_number for a in res.admitted] == [1]
+    assert res.exclusions[0].reason is ExclusionReason.INVALID_ATTESTATION
+
+
+def test_oversized_nonce_does_not_lock_in_a_ballot(env):
+    """Nonce 1 signed, ``1 + q`` claimed: excluded, so the voter's genuine nonce-2 re-vote
+    still wins under last-wins."""
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+
+    cfg = env.config(duplicate_policy=DuplicatePolicy.LAST_WINS)
+    locked = _self_signed(env, [3, 0, 0], P1, nonce=1, claimed_nonce=1 + CURVE_ORDER)
+    revote = env.ballot([0, 0, 3], P1, nonce=2)
+    res = admit([StoredBallot(0, locked), StoredBallot(1, revote)], cfg, env.mpk_bytes)
+    assert [a.sequence_number for a in res.admitted] == [1]
+    assert res.exclusions[0].reason is ExclusionReason.INVALID_ATTESTATION
+
+
+def test_unencodable_credential_is_malformed_in_ballot_crypto(env):
+    """Defense in depth below admission: ``verify_ballot_crypto`` alone must not raise on
+    a credential too large for the 32-byte ballot-message field."""
+    from shutter_governance_protocol.crypto.ballot import verify_ballot_crypto
+
+    b = env.ballot([1, 0, 2], P1)
+    att = replace(b.attestation, weight=2**256)
+    ok, reason = verify_ballot_crypto(
+        mpk=env.mpk_point, election_id=b.election_id, pseudonym=b.pseudonym, vk_bytes=b.vk,
+        ciphertext_bytes=[(ct.c1, ct.c2) for ct in b.ciphertexts], zk_proof=b.zk_proof,
+        voter_signature=b.voter_signature, attestation=att, num_candidates=3, budget=3,
+    )
+    assert (ok, reason) == (False, "MALFORMED")
+
+
+def test_undecodable_record_is_excluded_as_malformed(env):
+    """A stored record with no decodable envelope is MALFORMED and does not disturb the
+    rest of the admission."""
+    cfg = env.config()
+    ballots = [
+        _stored(env, 0, [1, 0, 2], P1),
+        StoredBallot(1, None, malformed_reason="JSONDecodeError: Expecting value"),
+        _stored(env, 2, [0, 3, 0], P2),
+    ]
+    res = admit(ballots, cfg, env.mpk_bytes)
+    assert [a.sequence_number for a in res.admitted] == [0, 2]
+    assert [(x.sequence_number, x.reason) for x in res.exclusions] == [(1, ExclusionReason.MALFORMED)]
+
+
+def test_dec_stored_ballot_never_raises():
+    from shutter_governance_protocol.envelopes.codecs import dec_stored_ballot
+
+    for bad in (None, {}, [], 7, "x", {"attestation": []}):
+        envelope, reason = dec_stored_ballot(bad)
+        assert envelope is None and reason

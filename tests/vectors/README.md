@@ -33,7 +33,10 @@ Repository-specific attestation, ballot and election fixtures can be generated b
 
 - `attestation/`: weighted `ATTESTATION_V1`, with positive **and** negative cases
   (tampered weight, tampered nonce, wrong-election binding), plus a large weight
-  (50) that must verify
+  (50) that must verify. `weight + q` and `nonce + q` must **fail**: a verifier must
+  reject values at or above the curve order instead of reducing them. `weight` and
+  `nonce` are decimal strings so readers that round JSON numbers above 2^53, such as
+  JavaScript, get the exact value; parse them with `BigInt(...)` or `int(...)`.
 - `flow/` — a complete variant-A/exact/weighted election (config, 5 ballots incl.
   one invalid + one duplicate, aggregate with exclusions, a `t`-share quorum, result),
   replayable to reproduce the admitted set, aggregate, and tally

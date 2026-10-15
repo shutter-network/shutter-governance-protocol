@@ -160,6 +160,27 @@ def dkg_commitments_digest(election_id: bytes, dealer_index: int, commitments: l
     return keccak(b"".join(parts))
 
 
+def proves_equivocation(election_id: bytes, dealer_index: int, dealer_address: bytes,
+                        reports: list[dict]) -> bool:
+    """Whether ``reports`` hold two different commitment vectors both signed by the dealer.
+
+    Each report is ``{"commitments": [hex, ...], "signature": "0x..."}``, as a keyper
+    received it. A dealer signs exactly one vector per election, so two distinct ones
+    under its signature can only come from the dealer itself. Unsigned or malformed
+    reports are ignored, so nobody can frame a dealer with a vector it never signed.
+    """
+    signed: set[tuple[bytes, ...]] = set()
+    for rep in reports:
+        try:
+            vector = tuple(bytes.fromhex(h) for h in rep["commitments"])
+            sig = bytes.fromhex(str(rep["signature"]).removeprefix("0x"))
+            if recover_digest(dkg_commitments_digest(election_id, dealer_index, list(vector)), sig) == dealer_address:
+                signed.add(vector)
+        except Exception:  # noqa: BLE001 — a malformed report proves nothing
+            continue
+    return len(signed) >= 2
+
+
 def dkg_share_digest(election_id: bytes, dealer_index: int, recipient_index: int, share: int) -> bytes:
     """Digest a dealer signs over the secret share it deals to one recipient. The
     signature is verified against the *unsealed* scalar, independent of transport sealing."""

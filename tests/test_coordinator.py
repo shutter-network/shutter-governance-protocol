@@ -44,14 +44,14 @@ class KeyperWorld:
         for srv in self._servers:
             srv.shutdown()
 
-    def register(self, *, voting_start=1000, voting_end=2000) -> bytes:
+    def register(self, *, voting_start=1000, voting_end=2000, t=T) -> bytes:
         config = ElectionConfig(
             # Assert the next id (the register replay guard); this env registers several.
             election_id=(len(self.dl.list_elections()) + 1).to_bytes(32, "big"),
             num_candidates=3, budget=3, mode=Mode.EXACT, variant=Variant.A,
             weighted=True, duplicate_policy=DuplicatePolicy.LAST_WINS,
             voting_start=voting_start, voting_end=voting_end,
-            threshold=Threshold(t=T, n=N),
+            threshold=Threshold(t=t, n=N),
             keypers=tuple(KeyperIdentity(signing_key=self.keyper_signers[i].identity, url=self.urls[i + 1])
                           for i in range(N)),
             eligibility_key=b"\xe1" * 48, result_publisher_key=self.coordinator.identity,  # coordinator = result publisher
@@ -295,3 +295,308 @@ def test_tally_phase_deadline_is_the_backstop(kw, monkeypatch):
     kw.clock.set(2000 + int(watcher.max_tally_phase_s) + 1)   # past the deadline
     assert watcher.scan_once()[eid.hex()] == "tally_abandoned"
     assert kw.dl.get_election(eid).tally_stalled is True
+
+
+# --------------------------------------------------------------------------- #
+#  An interrupted publish resumes the same key instead of starting over
+# --------------------------------------------------------------------------- #
+
+def _failing_publish(kw, keypers: set[int]):
+    """Patch ``requests.post`` so ``/dkg/publish`` fails, as if transiently, for ``keypers``."""
+    from unittest import mock
+
+    real = requests.post
+    targets = {kw.urls[i] + "/dkg/publish" for i in keypers}
+
+    def post(url, *a, **k):
+        if url in targets:
+            raise requests.ConnectionError("simulated transient failure")
+        return real(url, *a, **k)
+
+    return mock.patch("requests.post", side_effect=post)
+
+
+def _scan_until_finalized(kw, watcher, eid, *, attempts=4):
+    outcomes = []
+    for _ in range(attempts):
+        outcomes.append(watcher.scan_once()[eid.hex()])
+        if outcomes[-1] == "finalized":
+            break
+        kw.clock.set(kw.clock() + 5)  # past the back-off
+    return outcomes
+
+
+def test_interrupted_publish_resumes_the_same_key_3_of_3(kw):
+    """3-of-3: one keyper's publish fails once. The retry used to start a new ceremony,
+    leaving two keypers locked on the first key and the third on a second one, forever."""
+    eid = kw.register(t=3)
+    watcher = AutoDKG(kw.dl, kw.coordinator, clock=kw.clock, backoff_base_s=1, backoff_cap_s=1)
+    with _failing_publish(kw, {2}):
+        assert watcher.scan_once()[eid.hex()] == "registered_retry"
+    first_key = {s.pk_election for s in kw.dl.get_dkg_submissions(eid)}
+    assert len(first_key) == 1 and len(kw.dl.get_dkg_submissions(eid)) == 2
+
+    kw.clock.set(5)
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    subs = kw.dl.get_dkg_submissions(eid)
+    assert len(subs) == 3 and {s.pk_election for s in subs} == first_key
+    assert kw.dl.get_finalized_key(eid).pk_election in first_key
+
+
+def test_two_partial_publishes_still_finalize_2_of_3(kw):
+    """2-of-3: two attempts in a row each get only one vote out. That used to leave three
+    keypers on three different keys."""
+    eid = kw.register()
+    watcher = AutoDKG(kw.dl, kw.coordinator, clock=kw.clock, backoff_base_s=1, backoff_cap_s=1)
+    with _failing_publish(kw, {2, 3}):
+        assert watcher.scan_once()[eid.hex()] == "registered_retry"
+    kw.clock.set(5)
+    with _failing_publish(kw, {1, 3}):
+        # Keyper 1's vote is already in; resuming adds keyper 2's for the same key.
+        assert watcher.scan_once()[eid.hex()] == "finalized"
+    assert len({s.pk_election for s in kw.dl.get_dkg_submissions(eid)}) == 1
+
+
+def test_keyper_restart_between_round2_and_publish_keeps_its_key(kw, tmp_path):
+    """A keyper restarted after round 2 lost its in-memory commitments. Publishing used to
+    re-derive the key from them; it now re-sends the key it saved with its secret."""
+    from shutter_governance_protocol.services.keyper import build_keyper_app
+
+    eid = kw.register(t=3)
+    watcher = AutoDKG(kw.dl, kw.coordinator, clock=kw.clock, backoff_base_s=1, backoff_cap_s=1)
+    with _failing_publish(kw, {2}):
+        watcher.scan_once()
+
+    # Replace keyper 2's process with a fresh one over the same state directory.
+    kw._servers[1].shutdown()
+    app = build_keyper_app(kw.keyper_signers[1], kw.dl, kw.coordinator.identity,
+                           clock=kw.clock, state_dir=tmp_path / "keyper2")
+    port = int(kw.urls[2].rsplit(":", 1)[1])
+    srv = make_server("127.0.0.1", port, app, threaded=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    kw._servers[1] = srv
+
+    kw.clock.set(5)
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    assert len({s.pk_election for s in kw.dl.get_dkg_submissions(eid)}) == 1
+
+
+def test_keyper_refuses_a_new_round1_after_publishing(kw):
+    eid = kw.register()
+    watcher = kw.watcher()
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    token = watcher._tokens_by_committee[tuple(sorted(kw.urls.items()))][1]
+    r = requests.post(kw.urls[1] + "/dkg/round1", json={"electionId": eid.hex()},
+                      headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    assert r.status_code == 409
+
+
+# --------------------------------------------------------------------------- #
+#  A dealer that withholds shares or equivocates on its commitments
+# --------------------------------------------------------------------------- #
+
+def _intercept(kw, rule):
+    """Patch ``requests.post``. ``rule(url, body)`` returns a response to fake, or None to
+    send the request for real."""
+    from unittest import mock
+
+    real = requests.post
+
+    def post(url, *a, **k):
+        faked = rule(url, k.get("json") or {})
+        return faked if faked is not None else real(url, *a, **k)
+
+    return mock.patch("requests.post", side_effect=post)
+
+
+def _ok():
+    r = requests.models.Response()
+    r.status_code, r._content = 200, b'{"ok": true}'
+    return r
+
+
+def _withheld_by(kw, dealer, recipients, *, times=None):
+    """Dealer ``dealer`` reports success but never delivers its share to ``recipients``,
+    for the first ``times`` sends to each (``None``: never)."""
+    targets = {kw.urls[r] + "/dkg/receive_share" for r in recipients}
+    dropped: dict[str, int] = {}
+
+    def rule(url, body):
+        if url in targets and body.get("dealerIndex") == dealer:
+            if times is None or dropped.get(url, 0) < times:
+                dropped[url] = dropped.get(url, 0) + 1
+                return _ok()
+        return None
+    return rule
+
+
+def test_shares_that_never_arrive_are_settled_by_public_reveal(kw):
+    """Keyper 3's sealed shares to keypers 1 and 2 never arrive, even when re-sent. The key
+    used to finalize anyway and the tally failed after voting. Now dealer 3 is asked to
+    reveal the shares to the coordinator, which checks and forwards them, and everyone
+    publishes the same key."""
+    eid = kw.register()
+    with _intercept(kw, _withheld_by(kw, 3, {1, 2})):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    assert len(kw.dl.get_dkg_submissions(eid)) == 3
+
+
+def _refuses_public_reveal(kw, dealer):
+    target = kw.urls[dealer] + "/dkg/reveal_share"
+
+    def rule(url, body):
+        if url == target and body.get("public"):
+            r = requests.models.Response()
+            r.status_code, r._content = 409, b'{"error": "refused"}'
+            return r
+        return None
+    return rule
+
+
+def _both(*rules):
+    def rule(url, body):
+        for r in rules:
+            out = r(url, body)
+            if out is not None:
+                return out
+        return None
+    return rule
+
+
+def test_dealer_that_withholds_and_refuses_to_reveal_is_excluded(kw):
+    """A malicious dealer withholds keyper 2's share and will not reveal it. It is dropped
+    from the key, so keypers 1 and 2 both hold valid shares and dealer 3 has no veto."""
+    eid = kw.register()
+    with _intercept(kw, _both(_withheld_by(kw, 3, {2}), _refuses_public_reveal(kw, 3))):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    assert len(kw.dl.get_dkg_submissions(eid)) == 3  # every member could publish
+
+
+def test_counter_accusation_does_not_save_a_withholding_dealer(kw):
+    """Dealer 3 withholds keyper 2's share and falsely accuses keyper 2 back. Keyper 2
+    clears itself by revealing a valid share; dealer 3 cannot, so dealer 3 is excluded.
+    Before the public reveal the two accusations looked identical."""
+    import json
+    from unittest import mock
+
+    from shutter_governance_protocol.core import write_auth
+
+    eid = kw.register()
+    target = kw.urls[3] + "/dkg/round2"
+    real = requests.post
+    others = _both(_withheld_by(kw, 3, {2}), _refuses_public_reveal(kw, 3))
+    false_accusation = {
+        "electionId": eid.hex(), "accusedDealerIndex": 2, "recipientIndex": 3,
+        "signature": "0x" + write_auth.sign_digest(kw.keyper_signers[2].private_key,
+                                                   write_auth.dkg_accusation_digest(eid, 2, 3)).hex(),
+    }
+
+    def post(url, *a, **k):
+        faked = others(url, k.get("json") or {})
+        if faked is not None:
+            return faked
+        r = real(url, *a, **k)
+        if url == target:  # dealer 3 runs round 2, then claims keyper 2 cheated it
+            r._content = json.dumps({"verified": False, "complaints": [2],
+                                     "accusations": [false_accusation]}).encode()
+        return r
+
+    with mock.patch("requests.post", side_effect=post):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    # Keypers 1 and 2 published; dealer 3 kept "complaining" and excluded itself.
+    assert len(kw.dl.get_dkg_submissions(eid)) == 2
+
+
+def test_a_share_lost_once_is_repaired_and_everyone_publishes(kw):
+    """An honest dealer whose share to keyper 2 went missing re-sends it when accused."""
+    eid = kw.register()
+    with _intercept(kw, _withheld_by(kw, 3, {2}, times=1)):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    assert len(kw.dl.get_dkg_submissions(eid)) == 3
+
+
+def _report_other_commitments(kw, reporter, dealer, *, signed_by_dealer):
+    """Make keyper ``reporter`` report a different vector for ``dealer``, as if the dealer
+    had sent it a second set. ``signed_by_dealer=False`` forges the signature."""
+    from shutter_governance_protocol.core import write_auth
+    from shutter_governance_protocol.crypto.dkg import KeyperDKGState
+    from shutter_governance_protocol.crypto.points import g2_to_compressed
+
+    import json
+
+    target = kw.urls[reporter] + "/dkg/commitments"
+    real = requests.post
+
+    def post_and_rewrite(url, *a, **k):
+        r = real(url, *a, **k)
+        if url == target:
+            eid = bytes.fromhex(k["json"]["electionId"])
+            comms, _ = KeyperDKGState().round1(dealer, 3, 2)
+            vector = [g2_to_compressed(c) for c in comms]
+            key = kw.keyper_signers[dealer - 1 if signed_by_dealer else reporter - 1].private_key
+            sig = write_auth.sign_digest(key, write_auth.dkg_commitments_digest(eid, dealer, vector))
+            data = r.json()
+            data["commitments"][str(dealer)] = {"commitments": [v.hex() for v in vector],
+                                                "signature": "0x" + sig.hex()}
+            r._content = json.dumps(data).encode()
+        return r
+    return post_and_rewrite
+
+
+def test_equivocating_dealer_is_excluded_and_the_dkg_finalizes(kw):
+    """Keyper 2 holds a second set of commitments signed by dealer 3. Two vectors under
+    one dealer's signature prove equivocation, so dealer 3's contribution is dropped and
+    the key is built from dealers 1 and 2. All three members keep their committee key."""
+    from unittest import mock
+
+    eid = kw.register()
+    with mock.patch("requests.post", side_effect=_report_other_commitments(kw, 2, 3, signed_by_dealer=True)):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    assert len(kw.dl.get_finalized_key(eid).committee_pks) == 3
+
+
+def test_equivocation_that_would_leave_too_few_dealers_halts(kw):
+    """3-of-3: excluding one dealer would leave 2, below the threshold, so the ceremony
+    halts with the signed evidence instead."""
+    from unittest import mock
+
+    eid = kw.register(t=3)
+    with mock.patch("requests.post", side_effect=_report_other_commitments(kw, 2, 3, signed_by_dealer=True)):
+        assert kw.watcher().scan_once()[eid.hex()] == "dkg_complaint"
+    assert kw.dl.get_finalized_key(eid) is None
+
+
+def test_keyper_refuses_an_exclusion_without_valid_evidence(kw):
+    """A coordinator cannot drop an honest dealer by assertion: round 2 verifies the proof."""
+    eid = kw.register()
+    watcher = kw.watcher()
+    urls = watcher._keyper_urls(kw.dl.get_election(eid).config)
+    tokens = watcher._bootstrap(urls, watcher._member_addrs(kw.dl.get_election(eid).config))
+    for i in (1, 2, 3):
+        requests.post(kw.urls[i] + "/dkg/round1", json={"electionId": eid.hex()},
+                      headers={"Authorization": f"Bearer {tokens[i]}"}, timeout=10)
+    r = requests.post(kw.urls[1] + "/dkg/round2",
+                      json={"electionId": eid.hex(),
+                            "excluded": [{"dealer": 3, "reason": "equivocation", "evidence": []}]},
+                      headers={"Authorization": f"Bearer {tokens[1]}"}, timeout=10)
+    assert r.status_code == 400
+
+
+def test_a_keyper_cannot_frame_a_dealer_with_an_unsigned_set(kw):
+    """A report the dealer never signed is ignored, so a lying keyper cannot halt the DKG
+    by blaming an honest dealer."""
+    from unittest import mock
+
+    eid = kw.register()
+    with mock.patch("requests.post", side_effect=_report_other_commitments(kw, 2, 3, signed_by_dealer=False)):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+
+
+def test_withholding_that_cannot_be_excluded_falls_back(kw):
+    """3-of-3: excluding the withholding dealer would leave 2 dealers, below the threshold.
+    No exclusion is made; the victim excludes itself, too few can publish, and the DKG
+    fails before voting with the signed accusation, as before."""
+    eid = kw.register(t=3)
+    with _intercept(kw, _both(_withheld_by(kw, 3, {2}), _refuses_public_reveal(kw, 3))):
+        assert kw.watcher().scan_once()[eid.hex()] == "dkg_complaint"
+    assert kw.dl.get_finalized_key(eid) is None
