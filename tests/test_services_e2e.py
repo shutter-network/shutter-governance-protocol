@@ -76,6 +76,37 @@ def test_full_weighted_election(full_env):
     assert auditor.audit(fe.dl, fe.config.election_id).ok
 
 
+def test_full_at_most_election(full_env):
+    """atMost: a voter may spend anything from 0 to the budget. Partly spent, blank and
+    fully spent ballots all count; one carrying an exact-mode proof is excluded, since its
+    proof does not match the election's mode. Every ballot used to be MALFORMED here."""
+    from shutter_governance_protocol.core.config import Mode
+
+    fe = full_env
+    fe.config = replace(fe.config, mode=Mode.AT_MOST)
+    _register_and_dkg(fe)
+    fe.clock.set(1_500)
+    eid = fe.config.election_id
+    for i, v in enumerate([[1, 0, 0], [0, 2, 0], [0, 0, 0], [1, 1, 1]]):
+        submit_ballot(fe.dl, eid, fe.voter_ballot(v, bytes([i + 1]) * 32, weight=2),
+                      clock=fe.clock, gateway_signer=fe.gateway)
+    # Built as an exact-mode ballot (sum == budget, valid arithmetic in both modes).
+    exact = replace(fe, config=replace(fe.config, mode=Mode.EXACT)).voter_ballot([0, 0, 3], b"\x09" * 32)
+    # Stored directly, as the gateway's own checks would refuse it at intake.
+    fe.dl.submit_ballot(eid, exact, write_auth.sign_ballot(fe.gateway.private_key, eid, exact))
+    fe.clock.set(2_500)
+
+    result = agg.run_tally(fe.dl, eid, fe.result_publisher, fe.keypers, clock=fe.clock)
+    assert list(result.totals) == [2 * 2, 2 * 3, 2 * 1]  # [1+0+0+1, 0+2+0+1, 0+0+0+1] x weight 2
+    aggregate = fe.dl.get_aggregate(eid)
+    assert len(aggregate.admitted) == 4
+    assert [(x.sequence_number, x.reason) for x in aggregate.exclusions] == [(4, ExclusionReason.MALFORMED)]
+    # 12 of the 18 points the four counted voters could have spent: under the bound, not on it.
+    assert sum(result.totals) < result.bsgs_bound == 3 * 2 * 4
+    report = auditor.audit(fe.dl, eid)
+    assert report.ok, report.discrepancies
+
+
 # --------------------------------------------------------------------------- #
 #  Admin lead-time gate
 # --------------------------------------------------------------------------- #
@@ -86,6 +117,21 @@ def test_registration_rejected_without_lead_time(full_env):
     with pytest.raises(admin.RegistrationError, match="too soon for DKG"):
         admin.register_election(fe.dl, fe.config, fe.admin.sign_register(fe.config),
                             admin_identity=fe.admin.identity, clock=fe.clock, dkg_lead_time=DKG_LEAD_TIME)
+
+
+def test_registration_rejects_variant_b(full_env):
+    """Variant B (bit decomposition) is not implemented: every ballot in such an election
+    would be MALFORMED and the result all zeros. Refused at registration, before the data
+    layer is touched, until it is built."""
+    from shutter_governance_protocol.core.config import Variant
+
+    fe = full_env
+    fe.config = replace(fe.config, variant=Variant.B)
+    with pytest.raises(admin.RegistrationError, match="Variant B") as err:
+        admin.register_election(fe.dl, fe.config, fe.admin.sign_register(fe.config),
+                                admin_identity=fe.admin.identity, clock=fe.clock, dkg_lead_time=DKG_LEAD_TIME)
+    assert err.value.code == "UnsupportedVariant"
+    assert fe.dl.list_elections() == []
 
 
 # --------------------------------------------------------------------------- #

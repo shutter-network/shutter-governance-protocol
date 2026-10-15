@@ -196,7 +196,8 @@ class ElectionConfig:
     # out at tally, is the failure these ceilings prevent.
 
     # A ballot's validity proof is one OR-proof branch per (candidate, budget level):
-    # num_candidates * (budget + 1) branches, each 256 bytes. Two independent ceilings.
+    # num_candidates * (budget + 1) branches, each 256 bytes, plus another budget + 1 for
+    # the atMost proof over the sum. Two independent ceilings.
 
     #: Absolute encoding limits. ``n_outer`` is written as 2 bytes big-endian and
     #: ``branch_count = budget + 1`` likewise — so budget tops out one BELOW 0xFFFF, or the
@@ -228,10 +229,12 @@ class ElectionConfig:
                 f"Budget too large: {self.budget} exceeds {self.MAX_BUDGET} (the proof encodes "
                 f"budget+1 as two bytes)."
             )
-        branches = self.num_candidates * (self.budget + 1)
+        proofs = self.num_candidates + (1 if self.mode == Mode.AT_MOST else 0)
+        branches = proofs * (self.budget + 1)
         if branches > self.MAX_PROOF_BRANCHES:
+            sum_proof = " (+1 for the atMost sum proof)" if self.mode == Mode.AT_MOST else ""
             raise ValueError(
-                f"This election is too expensive to tally: {self.num_candidates} candidates x "
+                f"This election is too expensive to tally: {self.num_candidates} candidates{sum_proof} x "
                 f"(budget {self.budget} + 1) = {branches} proof branches per ballot, over the "
                 f"{self.MAX_PROOF_BRANCHES} limit. Every keyper and auditor verifies every "
                 f"ballot, at roughly 3 ms per branch. Reduce the candidates or the budget."

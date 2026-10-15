@@ -87,7 +87,8 @@ class Env:
 
     def ballot(self, votes, pseudonym: bytes, *, weight: int = 1,
                scheme: AttestationScheme = AttestationScheme.V1, nonce: int = 1,
-               election_id: bytes = ELECTION_ID, budget: int = 3) -> BallotEnvelope:
+               election_id: bytes = ELECTION_ID, budget: int = 3,
+               mode: str = "exact") -> BallotEnvelope:
         sk, vk = schnorr.keygen()
         vk_bytes = g1_to_compressed(vk)
         # The credential is minted *before* the ballot: since v2 the voter's signature
@@ -103,7 +104,7 @@ class Env:
         built = ballot_crypto.build_ballot(
             mpk=self.mpk_point, election_id=election_id, pseudonym=pseudonym,
             sk=sk, vk=vk, attestation=att, votes=votes, num_candidates=len(votes),
-            budget=budget,
+            budget=budget, mode=mode,
         )
         return BallotEnvelope(
             election_id=election_id, pseudonym=pseudonym, vk=vk_bytes,
@@ -191,6 +192,7 @@ class FullEnv:
             mpk=mpk, election_id=self.config.election_id, pseudonym=pseudonym,
             sk=sk, vk=vk, attestation=att, votes=votes,
             num_candidates=self.config.num_candidates, budget=self.config.budget,
+            mode=self.config.mode,
         )
         return BallotEnvelope(
             election_id=self.config.election_id, pseudonym=pseudonym, vk=vk_bytes,

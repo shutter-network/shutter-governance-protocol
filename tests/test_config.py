@@ -180,6 +180,17 @@ def test_verification_cost_limit_catches_what_the_encoding_limit_misses():
     make_config(num_candidates=20, budget=100, weighted=True)
 
 
+def test_at_most_counts_the_budget_proof_branches_too():
+    """An atMost ballot proves its sum with another (budget + 1)-branch OR proof, so it
+    costs (candidates + 1) x (budget + 1) branches to verify, not candidates x (budget + 1)."""
+    from shutter_governance_protocol.core.config import Mode
+
+    make_config(num_candidates=24, budget=103)                          # 2496 branches exact
+    with pytest.raises(ValueError, match="too expensive to tally"):
+        make_config(num_candidates=24, budget=103, mode=Mode.AT_MOST)   # 2600 with the sum proof
+    make_config(num_candidates=24, budget=99, mode=Mode.AT_MOST)        # 2500: at the line
+
+
 def test_ordinary_election_shapes_still_construct():
     for nc, budget in ((3, 3), (10, 10), (100, 9), (2, 400)):
         make_config(num_candidates=nc, budget=budget)

@@ -330,9 +330,11 @@ auditor can tell.
   with a DLEQ proof; Lagrange interpolation at zero; baby-step/giant-step recovery.
 - **Proofs:** Fiat-Shamir over a Merlin-style transcript; **keccak256** throughout
   (fixed for cross-language vector compatibility).
-- **Ballot validity:** Variant A (OR proof over `{0..B}`), mode **exact** (`Σ = B`),
-  weighted. Variant B (bit decomposition) and mode **atMost** are specified and
-  test-vectored but deferred in the reference implementation (conformance level 2).
+- **Ballot validity:** Variant A (OR proof over `{0..B}`), weighted, in mode **exact**
+  (`Σ = B`, proved by one DLEQ) or **atMost** (`Σ ≤ B`, proved by a `(B+1)`-branch OR
+  proof over the sum). In atMost a blank ballot (all zeros) is valid: it counts toward
+  turnout and adds no points. Variant B (bit decomposition) is specified and
+  test-vectored but not yet implemented (conformance level 2); registration refuses it.
 
 **Byte-for-byte TS↔Python compatibility is a protocol requirement,** enforced by a
 cross-language conformance-vector suite (not merely a CI convenience). The browser

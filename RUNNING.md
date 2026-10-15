@@ -340,8 +340,9 @@ wallet adapter uses `keccak256(address ‖ electionId)`, which anyone with a can
 address can recompute. Sponsorship alone does not hide that adapter's identity link.
 The issuer itself still knows which wallet requested each credential.
 
-**Ballot size on the chain backend.** Variant A's proof grows as `ℓ x (budget + 1)`, so at
-`ℓ = 3` a budget-100 ballot is ~78 KB. `submitVote` stores only `keccak256(zkProof)`; the proof
+**Ballot size on the chain backend.** Variant A's proof grows as `ℓ x (budget + 1)` branches
+(`(ℓ + 1) x (budget + 1)` in atMost, which also proves the sum), so at `ℓ = 3` a budget-100
+ballot is ~78 KB (~104 KB in atMost). `submitVote` stores only `keccak256(zkProof)`; the proof
 itself is carried in the `VoteSubmitted` event, which readers fetch and check against that hash
 (the bulletin-board pattern). Storing it cost ~49M gas for such a ballot, more than a 30M block.
 Calldata and log bytes still cost gas, so check a large ballot's gas against the target chain's

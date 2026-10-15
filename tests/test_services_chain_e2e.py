@@ -129,7 +129,7 @@ class ChainWorld:
         att = self.elig.issue_attestation(AttestationRequest(ELECTION_ID, pseudonym, vk_bytes, weight))
         built = ballot_crypto.build_ballot(
             mpk=mpk, election_id=ELECTION_ID, pseudonym=pseudonym, sk=sk, vk=vk,
-            attestation=att, votes=votes, num_candidates=3, budget=3,
+            attestation=att, votes=votes, num_candidates=3, budget=3, mode=self.config.mode,
         )
         return BallotEnvelope(
             election_id=ELECTION_ID, pseudonym=pseudonym, vk=vk_bytes,
@@ -174,6 +174,32 @@ def test_full_weighted_election_over_chain(anvil_w3):
     # with an empty signature and a copied committee, so the auditor found "no quorum".
     from shutter_governance_protocol.services import auditor
     report = auditor.audit(fresh, ELECTION_ID)
+    assert report.ok, report.discrepancies
+
+
+def test_at_most_election_over_chain(anvil_w3):
+    """atMost on chain: the mode is stored as uint8 1 and read back, and partly spent
+    ballots are admitted and counted."""
+    from dataclasses import replace
+
+    world = ChainWorld(anvil_w3)
+    world.config = replace(world.config, mode=Mode.AT_MOST)
+    admin.register_election(world.admin_dl, world.config, world.admin_signer.sign_register(world.config),
+                            admin_identity=world.admin_signer.identity, clock=world.clock, dkg_lead_time=DKG_LEAD_TIME)
+    assert world.admin_dl.get_election(ELECTION_ID).config.mode is Mode.AT_MOST
+    assert coord.ensure_dkg(ELECTION_ID, world.keypers, world.admin_dl, n=world.n, t=world.t,
+                            clock=world.clock, deadline=world.config.voting_start)
+
+    world.warp(1500)
+    submit_ballot(world.gateway_dl, ELECTION_ID, world.voter_ballot([1, 0, 1], b"\x01" * 32, weight=2), clock=world.clock)
+    submit_ballot(world.gateway_dl, ELECTION_ID, world.voter_ballot([0, 0, 0], b"\x02" * 32, weight=5), clock=world.clock)
+    world.warp(2500)
+    result = agg.run_tally(world.result_publisher_dl, ELECTION_ID, world.result_publisher_signer, world.keypers, clock=world.clock)
+    assert list(result.totals) == [2, 0, 2]
+    assert len(world.admin_dl.get_aggregate(ELECTION_ID).admitted) == 2
+
+    from shutter_governance_protocol.services import auditor
+    report = auditor.audit(world.admin_dl, ELECTION_ID)
     assert report.ok, report.discrepancies
 
 

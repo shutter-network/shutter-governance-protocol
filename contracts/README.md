@@ -419,9 +419,10 @@ Required environment variables (suitable for a `.env` file):
 
 Optional variables and defaults: `SELF_SUBMIT_FEE=0`, `MODE=0` (exact),
 `VARIANT=0` (A), `WEIGHTED=false`, `SCALE=1`, `DUPLICATE_POLICY=1` (last-wins),
-and `PROTOCOL_VERSION=SHUTTER-VOTE-v1`. The current Python ballot implementation
-supports A/exact; the contract stores the other settings without implementing
-their cryptographic verification.
+and `PROTOCOL_VERSION=SHUTTER-VOTE-v1`. The contract stores these settings and does not
+verify ballot proofs. The Python implementation supports variant A in both modes (`MODE=0`
+exact, `MODE=1` atMost). Variant B (`VARIANT=1`) is not implemented: the admin service
+refuses it at registration.
 
 Example `.env` (replace the timestamps with a future voting window):
 

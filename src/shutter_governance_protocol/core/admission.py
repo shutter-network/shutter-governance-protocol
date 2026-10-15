@@ -95,6 +95,7 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
         attestation=att,
         num_candidates=config.num_candidates,
         budget=config.budget,
+        mode=config.mode,
     )
     if not ok:
         # A pre-v2 client signed a message that excluded the credential. Surfaced as

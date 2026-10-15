@@ -28,7 +28,7 @@ import threading
 
 from shutter_governance_protocol.core import authz
 from shutter_governance_protocol.core.authz import Signer, verify_register, verify_request
-from shutter_governance_protocol.core.config import ElectionConfig
+from shutter_governance_protocol.core.config import ElectionConfig, Variant
 from shutter_governance_protocol.services.data_layer.data_layer import MAX_CONTENT_LENGTH
 from shutter_governance_protocol.ports.data_layer import ElectionDataLayer, WriteAuthorizationError
 
@@ -77,6 +77,15 @@ def register_election(
     if not verify_register(config.admin_key, admin_sig, config):
         raise WriteAuthorizationError(
             "Could not verify your admin signature on this registration. Reconnect your wallet and sign again.")
+    # Variant B (bit-decomposition proofs) is specified but not implemented here yet: every
+    # ballot would be MALFORMED and the result all zeros. Refused here rather than in
+    # ElectionConfig, so a stored config still decodes. Future work.
+    if config.variant != Variant.A:
+        raise RegistrationError(
+            "Variant B is not supported yet: ballots of such an election could not be counted. "
+            "Choose Variant A.",
+            code="UnsupportedVariant",
+        )
     now = clock()
     lead = config.voting_start - now
     if lead < dkg_lead_time:

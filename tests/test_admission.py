@@ -279,7 +279,7 @@ def test_unencodable_credential_is_malformed_in_ballot_crypto(env):
     ok, reason = verify_ballot_crypto(
         mpk=env.mpk_point, election_id=b.election_id, pseudonym=b.pseudonym, vk_bytes=b.vk,
         ciphertext_bytes=[(ct.c1, ct.c2) for ct in b.ciphertexts], zk_proof=b.zk_proof,
-        voter_signature=b.voter_signature, attestation=att, num_candidates=3, budget=3,
+        voter_signature=b.voter_signature, attestation=att, num_candidates=3, budget=3, mode="exact",
     )
     assert (ok, reason) == (False, "MALFORMED")
 

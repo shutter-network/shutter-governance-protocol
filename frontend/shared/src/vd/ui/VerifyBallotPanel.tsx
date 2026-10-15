@@ -23,9 +23,9 @@ export function VerifyBallotPanel({ ballot, globalIndex, overview, selectedElect
       electionId: overview.config.electionId.toString(),
       numCandidates: overview.config.numCandidates,
       budget: overview.config.budget,
-      // Munich defaults · adjust if election uses atMost mode or Variant B
-      mode: "exact",
-      variant: "A",
+      // The election's own settings: verifyBallot rejects a proof of the other mode.
+      mode: overview.config.mode,
+      variant: overview.config.variant,
       ballots: [ballot],
       electionAddress: selectedElection,
       exportedAt: new Date().toISOString(),

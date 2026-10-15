@@ -82,13 +82,20 @@ type OverviewDisplay = {
  * One word ("votes") used to stand for three different quantities, which is unreadable as
  * soon as weighting is on: points are budget x weight, voting power is the sum of the
  * admitted ballots' weights, and ballots are people. Falls back to points alone before the
- * aggregate has loaded. */
-function formatTallySummary(totalPoints: bigint, agg: EncryptedTally | null, t: TFunction): string {
-  const points = t("Total: {{n}} points", { n: totalPoints.toLocaleString() });
-  if (!agg) return points;
+ * aggregate has loaded. In atMost a voter may spend less than the budget, so the points
+ * are shown against the most that could have been spent. */
+function formatTallySummary(totalPoints: bigint, agg: EncryptedTally | null, t: TFunction,
+                            mode: "exact" | "atMost", budget: number): string {
+  if (!agg) return t("Total: {{n}} points", { n: totalPoints.toLocaleString() });
+  const points = mode === "atMost"
+    ? t("Total: {{n}} of up to {{max}} points", {
+        n: totalPoints.toLocaleString(),
+        max: (BigInt(budget) * agg.totalScaledWeight).toLocaleString(),
+      })
+    : t("Total: {{n}} points", { n: totalPoints.toLocaleString() });
   // "Votes" must be the *scaled* weight, not the raw one: it is what the points
-  // reconcile against (points = budget x scaled weight in exact mode), and reading
-  // it from the aggregate keeps that true if at-most mode ever ships.
+  // reconcile against (points = budget x scaled weight in exact mode, at most that in
+  // atMost).
   //
   // This used to read `totalAdmittedWeight`, which is the weight as *held*. At scale 1
   // the two are equal and nothing showed. Above it they diverge by the scale factor and
@@ -136,7 +143,7 @@ function computeOverviewDisplay(p: {
     return {
       leftLabel: "ELECTION FINALIZED", showCurrentlyDot: false,
       mainTitle: formatOutcomeOverviewTitle(outcome, t, Number(overview.config.budget)),
-      mainSub: formatTallySummary(outcome.totalVotes, aggregate, t),
+      mainSub: formatTallySummary(outcome.totalVotes, aggregate, t, overview.config.mode, Number(overview.config.budget)),
       footerDesc: t("Every stage has completed. The result is published and fully verifiable."),
       rightLabel: "WHAT YOU CAN DO NOW",
       rightDesc: t("Open any stage below to inspect what happened, then use the right column to re-run that step yourself."),
@@ -319,7 +326,7 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
         : { title: t("{{n}} ballots accepted", { n: overviewBallotTotal.toString() }), sub: t("Voting closed") };
       case 3: return aggregate ? { title: t("{{n}} ballots summed", { n: countedBallots.toString() }), sub: t("Into {{n}} encrypted candidate totals", { n: aggregate.aggregates.length }) } : null;
       case 4: return shares ? { title: t("{{count}} of {{total}} keyper shares received", { count: shares.length, total: overview.config.thresholdN.toString() }), sub: t("Threshold met · tally decrypted") } : null;
-      case 5: { if (!result) return null; const o = computeElectionOutcome(result.tally); return { title: formatOutcomeStageTitle(o, t, Number(overview!.config.budget)), sub: formatTallySummary(o.totalVotes, aggregate, t) }; }
+      case 5: { if (!result) return null; const o = computeElectionOutcome(result.tally); return { title: formatOutcomeStageTitle(o, t, Number(overview!.config.budget)), sub: formatTallySummary(o.totalVotes, aggregate, t, overview!.config.mode, Number(overview!.config.budget)) }; }
       default: return null;
     }
   }

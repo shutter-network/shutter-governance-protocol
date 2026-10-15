@@ -23,12 +23,14 @@ const MAX_BUDGET = 0xfffe;          // the proof encodes budget+1 as two bytes
 const MAX_PROOF_BRANCHES = 2500;    // ~3 ms each to verify, on every keyper and auditor
 
 /** Reject configs that would register cleanly but leave every ballot unusable. */
-function checkBallotBounds(numCandidates: number, budget: number): string | null {
+function checkBallotBounds(numCandidates: number, budget: number, mode: string): string | null {
   if (numCandidates > MAX_NUM_CANDIDATES) return `At most ${MAX_NUM_CANDIDATES} candidates.`;
   if (budget > MAX_BUDGET) return `Budget must be at most ${MAX_BUDGET}.`;
-  const branches = numCandidates * (budget + 1);
+  // An atMost ballot also proves its sum with another (budget + 1)-branch OR proof.
+  const atMost = mode === "atMost";
+  const branches = (numCandidates + (atMost ? 1 : 0)) * (budget + 1);
   if (branches > MAX_PROOF_BRANCHES) {
-    return `Too expensive to tally: ${numCandidates} candidates x (budget ${budget} + 1) = ` +
+    return `Too expensive to tally: ${numCandidates} candidates${atMost ? " (+1 for the atMost sum proof)" : ""} x (budget ${budget} + 1) = ` +
       `${branches} proof branches per ballot, over the ${MAX_PROOF_BRANCHES} limit. Every keyper ` +
       `and auditor verifies every ballot. Reduce the candidates or the budget.`;
   }
@@ -61,8 +63,8 @@ function F({ label, children, newRow, asDiv, hint }: { label: string; children: 
 const HINT: Record<string, Hint> = {
   candidates: { title: "Candidates", body: "Number of candidates for the election — a ballot has one encrypted vote value per candidate." },
   budget: { title: "Budget", body: "Points each voter distributes across the candidates. With a budget of 3 you might give 3 to one, or 1+1+1, or 2+1. A per-candidate ZK range proof enforces it." },
-  mode: { title: "Mode", body: "How the per-voter points must add up. exact: the votes must sum to exactly the budget. atMost: they may sum to at most the budget (a voter can spend fewer)." },
-  variant: { title: "Variant", body: "The per-candidate validity-proof construction. A: a (B+1)-branch OR proof per candidate (the standard). B: bit-decomposition proofs per candidate." },
+  mode: { title: "Mode", body: "How the per-voter points must add up. exact: the votes must sum to exactly the budget. atMost: they may sum to at most the budget (a voter can spend fewer, or none: a blank ballot still counts toward turnout). An atMost ballot is one candidate's worth larger, as it also proves its sum." },
+  variant: { title: "Variant", body: "The per-candidate validity-proof construction. A: a (B+1)-branch OR proof per candidate (the standard). B: bit-decomposition proofs per candidate, smaller for large budgets; planned, not supported yet." },
   weighting: { title: "Weighting", body: "One per voter: every voter counts once. Weighted: the eligibility service assigns each voter a weight, and their whole ballot is multiplied by it in the tally." },
   scale: { title: "Scale", body: "The unit this tally counts in. 1 means whole tokens and is almost always right; a larger value divides every voter equally, and is only needed when a token supply would put the tally beyond what the coordinator can compute." },
   duplicate: { title: "Vote duplicate policy", body: "If one voter (pseudonym) submits more than one ballot, which counts at tally time. last-wins: the most recent. first-wins: the first." },
@@ -335,7 +337,7 @@ const FORM_STEPS = [
 
 function Seg({
   value, options, onChange,
-}: { value: string; options: { value: string; label: string }[]; onChange: (v: string) => void }) {
+}: { value: string; options: { value: string; label: string; disabled?: boolean; title?: string }[]; onChange: (v: string) => void }) {
   return (
     <div className="seg" role="group">
       {options.map((o) => (
@@ -344,6 +346,9 @@ function Seg({
           type="button"
           className={`seg__btn${value === o.value ? " seg__btn--on" : ""}`}
           onClick={() => onChange(o.value)}
+          disabled={o.disabled}
+          title={o.title}
+          style={o.disabled ? { opacity: 0.45, cursor: "not-allowed" } : undefined}
         >
           {o.label}
         </button>
@@ -449,7 +454,7 @@ function FormRegister({ wallet, onViewElection }: { wallet: Wallet | null; onVie
           throw new Error(`Invalid self-submit fee "${f.selfSubmitFee}" — enter ETH, e.g. 0.0010 (or 0).`);
         }
       }
-      const boundsError = checkBallotBounds(Number(f.numCandidates), Number(f.budget));
+      const boundsError = checkBallotBounds(Number(f.numCandidates), Number(f.budget), f.mode);
       if (boundsError) throw new Error(boundsError);
       const config = {
         electionId: ZERO_EID,
@@ -488,7 +493,7 @@ function FormRegister({ wallet, onViewElection }: { wallet: Wallet | null; onVie
         <F label="Candidates" hint={HINT.candidates}><input type="number" value={f.numCandidates} onChange={(e) => set("numCandidates", e.target.value)} /></F>
         <F label="Budget" hint={HINT.budget}><input type="number" value={f.budget} onChange={(e) => set("budget", e.target.value)} /></F>
         <F label="Mode" hint={HINT.mode}><Seg value={f.mode} onChange={(v) => set("mode", v)} options={[{ value: "exact", label: "exact" }, { value: "atMost", label: "atMost" }]} /></F>
-        <F label="Variant" hint={HINT.variant}><Seg value={f.variant} onChange={(v) => set("variant", v)} options={[{ value: "A", label: "A" }, { value: "B", label: "B" }]} /></F>
+        <F label="Variant" hint={HINT.variant}><Seg value={f.variant} onChange={(v) => set("variant", v)} options={[{ value: "A", label: "A" }, { value: "B", label: "B (planned)", disabled: true, title: "Variant B is not supported yet" }]} /></F>
         <F label="Weighting" hint={HINT.weighting}><Seg value={f.weighted ? "yes" : "no"} onChange={(v) => setWeighted(v === "yes")} options={[{ value: "no", label: "One per voter" }, { value: "yes", label: "Weighted" }]} /></F>
         <F label="Scale" hint={HINT.scale}><input type="number" min={1} value={f.scale} onChange={(e) => set("scale", e.target.value)} /></F>
         <F label="Vote Duplicate Policy" hint={HINT.duplicate} newRow><Seg value={f.duplicatePolicy} onChange={(v) => set("duplicatePolicy", v)} options={[{ value: "last-wins", label: "last-wins" }, { value: "first-wins", label: "first-wins" }]} /></F>
