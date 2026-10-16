@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import type { Ballot, ElectionConfigView, DkgResultView } from "../eth/types";
 import { CodeBlock } from "./CodeBlock";
 
-const SDK_PACKAGE = "@shutter-network/urban-verified-crypto";
+import { SDK_PACKAGE, SDK_VERSION } from "./sdk";
 
 type Props = {
   ballot: Ballot;
@@ -23,9 +23,9 @@ export function VerifyBallotPanel({ ballot, globalIndex, overview, selectedElect
       electionId: overview.config.electionId.toString(),
       numCandidates: overview.config.numCandidates,
       budget: overview.config.budget,
-      // Munich defaults · adjust if election uses atMost mode or Variant B
-      mode: "exact",
-      variant: "A",
+      // The election's own settings: verifyBallot rejects a proof of the other mode.
+      mode: overview.config.mode,
+      variant: overview.config.variant,
       ballots: [ballot],
       electionAddress: selectedElection,
       exportedAt: new Date().toISOString(),
@@ -41,50 +41,31 @@ export function VerifyBallotPanel({ ballot, globalIndex, overview, selectedElect
     URL.revokeObjectURL(url);
   }
 
-  const installCmd = `npm install ${SDK_PACKAGE} viem`;
+  const installCmd = `npm install ${SDK_PACKAGE}@${SDK_VERSION}`;
 
   const scriptCode = [
-    `const { initCurves, G1Point, G2Point, schnorrVerify, verifyBallot } = require("${SDK_PACKAGE}");`,
+    `const { initCurves, G2Point, verifyBallot } = require("${SDK_PACKAGE}");`,
     `const { readFileSync } = require("node:fs");`,
-    `const { keccak256 } = require("viem");`,
     `const fromHex = (h) => Uint8Array.from(Buffer.from(String(h).replace(/^0x/, ""), "hex"));`,
-    `const g2FromHex = (h) => G2Point.fromBytes(fromHex(h));`,
     `const electionId32 = (id) => fromHex(BigInt(id).toString(16).padStart(64, "0"));`,
-    `// att packs scheme(1) ‖ weight(32 BE) ‖ nonce(32 BE) ‖ R(48) ‖ s(32). The verifier`,
-    `// dispatches on scheme like shutter_governance_protocol's verify_attestation: 1=ATTESTATION_V1 (domain-separated`,
-    `// transcript over electionId,pseudonym,vk,weight,nonce), 0=LEGACY (weightless, weight 1).`,
-    `const u32be = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0); return b; };`,
-    `const scalar32 = (w) => { const b = Buffer.alloc(32); let x = BigInt(w); for (let i = 31; i >= 0 && x > 0n; i--) { b[i] = Number(x & 0xffn); x >>= 8n; } return b; };`,
-    `const tlv = (p, tag, v) => { const tb = Buffer.from(tag, "utf8"); p.push(u32be(tb.length), tb, u32be(v.length), Buffer.from(v)); };`,
-    `const v1Digest = (eid, ps, vk, w, n) => { const p = [Buffer.from("SHUTTER-VOTE-ATTEST-v1", "utf8")]; tlv(p, "attest:electionId", eid); tlv(p, "attest:pseudonym", ps); tlv(p, "attest:vk", vk); tlv(p, "attest:weight", scalar32(w)); tlv(p, "attest:nonce", scalar32(n)); return fromHex(keccak256(Buffer.concat(p))); };`,
-    `const legacyDigest = (eid, ps, vk) => fromHex(keccak256(Buffer.concat([Buffer.from(eid), Buffer.from(ps), Buffer.from(vk)])));`,
-    `const makeWrVerifier = (pkWr) => {`,
-    `  const wrVk = G1Point.fromBytes(pkWr);`,
-    `  // packed att blob: scheme(1) ‖ weight(32 BE) ‖ nonce(32 BE) ‖ sig(80 = R‖s)`,
-    `  return (eid, ps, vk, att) => {`,
-    `    if (eid.length !== 32 || ps.length !== 32 || vk.length !== 48) return false;`,
-    `    try {`,
-    `      const scheme = att[0];`,
-    `      let w = 0n; for (let i = 1; i < 33; i++) w = (w << 8n) + BigInt(att[i]);`,
-    `      let n = 0n; for (let i = 33; i < 65; i++) n = (n << 8n) + BigInt(att[i]);`,
-    `      if (w < 1n || (scheme !== 1 && w !== 1n) || (scheme === 1 && n < 1n)) return false;`,
-    `      const sig = att.subarray(65);`,
-    `      let s = 0n; for (let i = 48; i < 80; i++) s = (s << 8n) + BigInt(sig[i]);`,
-    `      const msg = scheme === 1 ? v1Digest(eid, ps, vk, w, n) : legacyDigest(eid, ps, vk);`,
-    `      return schnorrVerify(wrVk, msg, { R: G1Point.fromBytes(sig.subarray(0, 48)), s });`,
-    `    } catch { return false; }`,
-    `  };`,
-    `};`,
     `async function main() {`,
     `  const f = JSON.parse(readFileSync("${fixtureFilename}", "utf8"));`,
     `  const b = f.ballots?.[0];`,
     `  if (!b) throw new Error("Fixture missing ballots[0]");`,
+    `  if (!b.attestation) { console.log(\`✗ INVALID: malformed record (\${b.malformed})\`); process.exit(1); }`,
     `  await initCurves();`,
+    `  // The eligibility credential is checked against the issuer's key (pkWrG1) and must`,
+    `  // belong to this ballot; the voter's signature covers it.`,
+    `  const a = b.attestation;`,
     `  const res = verifyBallot(`,
-    `    { electionId: electionId32(f.electionId), pseudonym: fromHex(b.pseudonym), vk: fromHex(b.vk), ciphertexts: b.ciphertexts.map(({ c1, c2 }) => [fromHex(c1), fromHex(c2)]), zkProof: fromHex(b.zkProof), voterSignature: fromHex(b.voterSignature), wrAttestation: fromHex(b.wrAttestation) },`,
+    `    { electionId: electionId32(f.electionId), pseudonym: fromHex(b.pseudonym), vk: fromHex(b.vk),`,
+    `      ciphertexts: b.ciphertexts.map(({ c1, c2 }) => [fromHex(c1), fromHex(c2)]),`,
+    `      zkProof: fromHex(b.zkProof), voterSignature: fromHex(b.voterSignature),`,
+    `      attestation: { electionId: electionId32(a.electionId), pseudonym: fromHex(a.pseudonym), vk: fromHex(a.vk),`,
+    `                     weight: BigInt(a.weight), nonce: BigInt(a.nonce), signature: fromHex(a.signature) } },`,
     `    { numCandidates: f.numCandidates, budget: f.budget, mode: f.mode ?? "exact", variant: f.variant ?? "A" },`,
-    `    g2FromHex(f.mpkElectionG2),`,
-    `    makeWrVerifier(fromHex(f.pkWrG1)),`,
+    `    G2Point.fromBytes(fromHex(f.mpkElectionG2)),`,
+    `    fromHex(f.pkWrG1),`,
     `  );`,
     `  console.log(res.ok ? "✓ VALID" : \`✗ INVALID: \${res.reason}\`);`,
     `  process.exit(res.ok ? 0 : 1);`,

@@ -117,9 +117,10 @@ export const registerElection = (config: unknown, signature: Hex, dkgLeadTime?: 
 export const cancelElection = (idBareHex: string, signature: Hex) =>
   req<unknown>(`${ADMIN_URL}/elections/${idBareHex}/cancel`, jsonPost({ signature }));
 
-/** Admin "retry" for a stalled tally: clears the persisted flag so the coordinator resumes. */
-export const retryTally = (idBareHex: string, signature: Hex) =>
-  req<unknown>(`${ADMIN_URL}/elections/${idBareHex}/tally/retry`, jsonPost({ signature }));
+/** Admin "retry" for a stalled tally: clears the persisted flag so the coordinator resumes.
+ *  `issuedAt` is the unix time the signature covers (see adminSign.retryTallyDigest). */
+export const retryTally = (idBareHex: string, signature: Hex, issuedAt: number) =>
+  req<unknown>(`${ADMIN_URL}/elections/${idBareHex}/tally/retry`, jsonPost({ signature, issuedAt }));
 
 // -- eligibility (voter) ---------------------------------------------------- //
 

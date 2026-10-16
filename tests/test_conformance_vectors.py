@@ -7,8 +7,9 @@ hex byte blobs. Adopted from the reference SDK suite and extended here; this is
 the protocol conformance gate (single command: ``pytest tests/test_conformance_vectors.py``).
 
 Categories: encrypt, dleq, or, budget (exact+atMost), schnorr, decrypt-share,
-ballot, tally. Variant-B / atMost *ballots* are conformance level 2 (specified,
-not implemented in the reference); adding one here fails until it is supported.
+ballot, tally. Variant-A ballots are checked in both budget modes (exact and atMost);
+Variant-B *ballots* are conformance level 2 (specified, not implemented in the
+reference), and adding one here fails until it is supported.
 """
 
 from __future__ import annotations
@@ -140,7 +141,7 @@ def test_decrypt_share_vector(name, v):
 
 
 # --------------------------------------------------------------------------- #
-#  ballot — full validity-proof + signature (variant A / exact = level 1)
+#  ballot — full validity-proof + signature (variant A, exact and atMost)
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("name,v", _load("ballot"), ids=_ids(_load("ballot")))
@@ -157,8 +158,8 @@ def test_ballot_vector(name, v):
             "signature": out["voterSignature"],
         }
     params = i["params"]
-    if params["mode"] != "exact" or params["variant"] != "A":
-        pytest.fail("variant B / atMost ballot is conformance level 2 (not implemented)")
+    if params["variant"] != "A":
+        pytest.fail("variant B ballot is conformance level 2 (not implemented)")
     from shutter_governance_protocol.envelopes.types import Attestation, AttestationScheme
     a = i["attestation"]
     attestation = Attestation(
@@ -177,6 +178,7 @@ def test_ballot_vector(name, v):
         attestation=attestation,
         num_candidates=params["numCandidates"],
         budget=params["budget"],
+        mode=params["mode"],
     )
     expected = v["expected"]
     assert ok is (expected["verify"] if "verify" in expected else expected["verifyBallot"])
@@ -210,8 +212,10 @@ def test_attestation_vector(name, v):
     i = v["inputs"]
     att = Attestation(
         election_id=_hx(i["electionId"]), pseudonym=_hx(i["pseudonym"]), vk=_hx(i["vk"]),
-        weight=i["weight"], signature=_hx(i["signature"]), scheme=AttestationScheme(i["scheme"]),
-        nonce=i.get("nonce", 1),
+        # Decimal strings in the attestation vectors (exact in any JSON reader); int() also
+        # accepts a plain number.
+        weight=int(i["weight"]), signature=_hx(i["signature"]), scheme=AttestationScheme(i["scheme"]),
+        nonce=int(i.get("nonce", 1)),
     )
     ok = verify_attestation(_hx(i["eligibilityKey"]), att, election_id=_hx(i["electionId"]))
     assert ok is v["expected"]["verify"]

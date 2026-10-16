@@ -8,8 +8,6 @@ import {VotingTypes} from "../VotingTypes.sol";
 interface IElectionRegistry is IAccessControl {
     event ElectionCreated(address indexed election, uint256 indexed electionId, address indexed keyperSet);
 
-    function VOTE_PROXY_ROLE() external view returns (bytes32);
-    function RESULT_PUBLISHER_ROLE() external view returns (bytes32);
     function electionCount() external view returns (uint256);
     function elections(uint256 electionId) external view returns (address);
     function getElections(uint256 startElectionId, uint256 count) external view returns (address[] memory);

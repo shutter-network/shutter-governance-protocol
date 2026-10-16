@@ -39,6 +39,7 @@ export async function fetchElectionOverview(electionId: number): Promise<{
     mode: cfg.mode,
     variant: cfg.variant,
     scale: cfg.scale ?? 1,
+    duplicatePolicy: cfg.duplicatePolicy ?? "last-wins",
     thresholdN: BigInt(cfg.threshold.n),
     thresholdT: BigInt(cfg.threshold.t),
     keyperAddresses: cfg.keypers.map((k) => k.signingKey),
@@ -58,37 +59,53 @@ export async function fetchElectionOverview(electionId: number): Promise<{
   };
 }
 
+/** A credential integer as a decimal string. The API sends these as JSON numbers, which
+ *  the browser parses as floats: above 2^53 the value is already rounded, and `String`
+ *  would render it in exponent form that `BigInt` rejects. `BigInt(n)` keeps the
+ *  (rounded) integer, so such a credential fails its signature check instead of crashing
+ *  the verifier. Exact values need the API to send these as decimal strings. */
+const decimal = (v: unknown): string =>
+  typeof v === "number" && Number.isFinite(v) ? BigInt(Math.trunc(v)).toString() : String(v);
+
 export async function fetchBallotsPage(
   electionId: number,
   startIndex: number,
   count: number,
 ): Promise<{ total: bigint; ballots: Ballot[] }> {
-  const resp = await api.listBallots(electionId, Math.max(0, startIndex), count);
-  const ballots: Ballot[] = (resp.ballots as any[]).map((b) => ({
+  // The server may return fewer rows than asked for (pages are capped by size as well
+  // as count, so large ballots come back a few at a time). Keep asking until the page is
+  // full or the list ends, so a page never silently skips the indices it was short by.
+  const raw: any[] = [];
+  let total = 0n;
+  do {
+    const resp = await api.listBallots(electionId, Math.max(0, startIndex) + raw.length, count - raw.length);
+    total = BigInt(resp.total);
+    if (resp.ballots.length === 0) break;
+    raw.push(...resp.ballots);
+  } while (raw.length < count && BigInt(Math.max(0, startIndex) + raw.length) < total);
+  const ballots: Ballot[] = raw.map((b) => b.malformed !== undefined ? ({
+    // Kept in place so page positions line up with the API's ballot indices.
+    pseudonym: "0x" as Hex, vk: "0x" as Hex, ciphertexts: [], zkProof: "0x" as Hex,
+    voterSignature: "0x" as Hex, attestation: null, nonce: 0, weight: 0,
+    malformed: String(b.malformed ?? "undecodable record"),
+  }) : ({
     pseudonym: b.pseudonym as Hex,
     vk: b.vk as Hex,
     ciphertexts: (b.ciphertexts ?? []).map((ct: any) => ({ c1: ct.c1 as Hex, c2: ct.c2 as Hex })),
     zkProof: b.zkProof as Hex,
     voterSignature: b.voterSignature as Hex,
-    // shutter_governance_protocol's attestation is structured (scheme, weight, nonce, 80-byte R‖s sig); the SDK's WR
-    // verifier callback only receives one opaque blob, so pack everything the scheme-
-    // directed verifier needs into it: scheme(1) ‖ weight(32 BE) ‖ nonce(32 BE) ‖ signature(80).
-    wrAttestation: packWrAttestation(b.attestation?.scheme, b.attestation?.weight, b.attestation?.nonce, b.attestation?.signature),
+    attestation: b.attestation ? {
+      electionId: String(b.attestation.electionId),
+      pseudonym: b.attestation.pseudonym as Hex,
+      vk: b.attestation.vk as Hex,
+      weight: decimal(b.attestation.weight),
+      nonce: decimal(b.attestation.nonce ?? 1),
+      signature: b.attestation.signature as Hex,
+    } : null,
     nonce: Number(b.attestation?.nonce ?? 1),
     weight: Number(b.attestation?.weight ?? 1),
   }));
-  return { total: BigInt(resp.total), ballots };
-}
-
-/** Pack shutter_governance_protocol's structured attestation into the single `att` blob the WR verifier reads:
- * `scheme(1) ‖ weight(32-byte BE) ‖ nonce(32-byte BE) ‖ signature(80 = R‖s)`. scheme byte:
- * 0x01 = ATTESTATION_V1, 0x00 = LEGACY (weightless). Mirrors shutter_governance_protocol core `verify_attestation`. */
-function packWrAttestation(scheme: string | undefined, weight: number | undefined, nonce: number | undefined, sig: string | undefined): Hex {
-  const schemeByte = scheme === "LEGACY" ? "00" : "01";
-  const weightHex = BigInt(weight ?? 1).toString(16).padStart(64, "0");
-  const nonceHex = BigInt(nonce ?? 1).toString(16).padStart(64, "0");
-  const sigHex = (sig ?? "0x").replace(/^0x/, "");
-  return ("0x" + schemeByte + weightHex + nonceHex + sigHex) as Hex;
+  return { total, ballots };
 }
 
 export async function fetchAggregate(electionId: number): Promise<EncryptedTally | null> {
@@ -105,6 +122,10 @@ export async function fetchAggregate(electionId: number): Promise<EncryptedTally
       aggregate.totalScaledWeight ?? aggregate.totalAdmittedWeight ?? 0,
     ),
     admittedCount: (aggregate.admitted ?? []).length,
+    admitted: (aggregate.admitted ?? []).map(Number),
+    exclusions: (aggregate.exclusions ?? []).map((e: any) => ({
+      sequenceNumber: Number(e.sequenceNumber), reason: String(e.reason),
+    })),
   };
 }
 

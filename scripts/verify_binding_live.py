@@ -52,6 +52,10 @@ def main() -> int:
     failures = 0
     for sb in ballots:
         env = sb.envelope
+        if env is None:
+            print(f"  #{sb.sequence_number}: malformed record ({sb.malformed_reason})")
+            failures += 1
+            continue
         att = env.attestation
         bound = verify_binding_sig(
             env.vk,

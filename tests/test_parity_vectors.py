@@ -87,6 +87,7 @@ def test_ballot_known_vector_byte_parity():
         votes=[int(x) for x in i["votes"]],
         num_candidates=params["numCandidates"],
         budget=params["budget"],
+        mode=params["mode"],
         rs=[_int(r) for r in i["randomness"]],
         range_proof_w=[_int(w) for w in i["range_proof_w"]],
         range_proof_sims=sims,
@@ -116,6 +117,7 @@ def test_ballot_known_vector_verifies():
         attestation=_vector_attestation(i),
         num_candidates=params["numCandidates"],
         budget=params["budget"],
+        mode=params["mode"],
     )
     assert ok is v["expected"]["verifyBallot"]
     assert reason is None

@@ -43,25 +43,3 @@ export function deriveState(c: StateTimings, f: StateFacts, now: number): Electi
 export function isVotingOpen(c: StateTimings, now: number): boolean {
   return c.votingStart <= now && now < c.votingEnd;
 }
-
-/** Non-terminal states never change again on their own. */
-export const TERMINAL_STATES: ReadonlySet<ElectionState> = new Set<ElectionState>([
-  "Cancelled",
-  "Complete",
-  "DKGFailed",
-]);
-
-/** Theme badge-color modifier class for a lifecycle state (see theme.css). */
-export function stateBadgeClass(s: ElectionState): string {
-  const map: Record<ElectionState, string> = {
-    Complete: "badge--green",
-    Voting: "badge--blue",
-    KeyReady: "badge--blue",
-    Tallying: "badge--amber",
-    TallyStalled: "badge--red",
-    Registered: "badge--gray",
-    Cancelled: "badge--gray",
-    DKGFailed: "badge--red",
-  };
-  return `badge ${map[s]}`;
-}

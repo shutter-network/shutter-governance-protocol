@@ -117,3 +117,45 @@ def test_distinct_from_legacy_scheme():
     legacy = keccak(ELECTION + PSEUDO + voter)
     v1 = attestation.attestation_message(ELECTION, PSEUDO, voter, weight=1, nonce=1)
     assert legacy != v1
+
+
+# --------------------------------------------------------------------------- #
+#  Canonical weight / nonce: values >= q must not reuse a smaller value's signature
+# --------------------------------------------------------------------------- #
+
+def test_weight_plus_curve_order_is_rejected():
+    """``w + q`` hashes like ``w`` if the transcript reduces mod q. It must not verify."""
+    from dataclasses import replace
+
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+
+    sk, vk, vk_b = _elig_key()
+    att = _attest(sk, vk, _voter_vk(), weight=1)
+    for weight in (1 + CURVE_ORDER, 1 + 2 * CURVE_ORDER, 1 + 3 * CURVE_ORDER):
+        assert not verify_attestation(vk_b, replace(att, weight=weight), election_id=ELECTION)
+
+
+def test_nonce_plus_curve_order_is_rejected():
+    from dataclasses import replace
+
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+
+    sk, vk, vk_b = _elig_key()
+    att = _attest(sk, vk, _voter_vk(), weight=1)
+    assert not verify_attestation(vk_b, replace(att, nonce=1 + CURVE_ORDER), election_id=ELECTION)
+
+
+def test_issuer_refuses_weight_or_nonce_at_curve_order():
+    import pytest
+
+    from shutter_governance_protocol.crypto.params import CURVE_ORDER
+
+    sk, vk, _ = _elig_key()
+    voter = _voter_vk()
+    with pytest.raises(ValueError):
+        attestation.sign_attestation(sk, vk, ELECTION, PSEUDO, voter, CURVE_ORDER, 1)
+    with pytest.raises(ValueError):
+        attestation.sign_attestation(sk, vk, ELECTION, PSEUDO, voter, 1, CURVE_ORDER)
+    # The largest canonical value is still accepted.
+    att = _attest(sk, vk, voter, weight=CURVE_ORDER - 1)
+    assert verify_attestation(g1_to_compressed(vk), att, election_id=ELECTION)

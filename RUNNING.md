@@ -295,7 +295,8 @@ when eyeballing an election by hand (the curls above). They are *display-shaped*
 ids are decimalized and ballot pages cap at 200. The `/port` routes
 (`/port/elections/<64-hex>/…`) are the byte-verbatim `ElectionDataLayer` contract —
 bare-hex ids and ballot storage metadata. Port ballot pages are capped at 1,000
-records; request a positive `count` and advance `start` until all records are read. Use `/port` when the bytes matter
+records and about 8 MiB of JSON, so a page of large ballots holds fewer; request a positive
+`count` and advance `start` by the rows actually returned until all records are read. Use `/port` when the bytes matter
 (re-deriving a digest, verifying a signature, reading every ballot) and when writing a
 client that speaks the port; that is what keypers point `SHUTTER_GOVERNANCE_PROTOCOL_API_URL` at.
 
@@ -315,7 +316,11 @@ older signed ballot.
 **Eligibility = sole authority on voter weight.** It binds each voter's weight into the signed
 `ATTESTATION_V1` (over `electionId, pseudonym, vk, weight, nonce`); the config only sets policy
 (`weighted`, and a `scale` divisor applied to every weight at tally). Admission rejects
-`weight < 1`. The
+`weight < 1`, and in an unweighted (one per voter) election any weight other than 1. The
+bundled issuer therefore reads each election's `weighted` setting through the public API
+(`SHUTTER_GOVERNANCE_PROTOCOL_API_URL` in `deploy/.env.eligibility`) and issues weight 1 for
+an unweighted election, whatever the allowlist says. If it can't read the setting, `/attest`
+returns 503 and issues nothing. The
 bundled stub grants a fixed `ELIGIBILITY_DUMMY_WEIGHT` (default 1); real weights come from the
 integrator's source (token balance, registry, membership tier, …).
 
@@ -335,13 +340,14 @@ wallet adapter uses `keccak256(address ‖ electionId)`, which anyone with a can
 address can recompute. Sponsorship alone does not hide that adapter's identity link.
 The issuer itself still knows which wallet requested each credential.
 
-**Budget is bounded on the chain backend.** `submitVote` stores the whole ballot, and Variant A's
-proof grows as `ℓ x (budget + 1)`, so at `ℓ = 3` a budget-100 ballot is ~78 KB — about **49M gas**
-of storage against a 30M block limit. Casting fails with
-`Out of gas: gas required exceeds allowance: 30000000`, which names the gas and not the cause.
-For three candidates, budget 10 is much smaller than budget 100. Check transaction
-gas against the target chain's block limit; these example limits are not universal.
-Use the database backend for ballots too large to fit the target chain.
+**Ballot size on the chain backend.** Variant A's proof grows as `ℓ x (budget + 1)` branches
+(`(ℓ + 1) x (budget + 1)` in atMost, which also proves the sum), so at `ℓ = 3` a budget-100
+ballot is ~78 KB (~104 KB in atMost). `submitVote` stores only `keccak256(zkProof)`; the proof
+itself is carried in the `VoteSubmitted` event, which readers fetch and check against that hash
+(the bulletin-board pattern). Storing it cost ~49M gas for such a ballot, more than a 30M block.
+Calldata and log bytes still cost gas, so check a large ballot's gas against the target chain's
+block limit; these example limits are not universal. The same applies to the aggregate: only
+its digest is stored, and the artifact is in the `AggregatePublished` event.
 
 **Timing.** You choose the voting window **in the register form** (step 5) — for a quick demo
 pick a short one (e.g. a couple of minutes out and a couple of minutes long), leaving enough
@@ -357,6 +363,22 @@ can still publish if another keyper keeps complaining. The ceremony fails when
 no key finalises after repair; signed accusations are logged as `op=dkg_complaint`.
 An election without a finalised key at voting start derives to `DKGFailed`. The accused dealer's `/dkg/reveal_share` sends a replacement share sealed to the
 accusing recipient; the secret share is not returned to the coordinator.
+A share that never arrives counts as a bad share, so a dealer that withholds shares is
+accused and asked to re-send like any other. If a dispute survives the re-sends, the
+accused dealer must reveal the disputed share, signed, to the coordinator, which checks it
+against the dealer's commitments and forwards it to the accuser. A dealer that cannot
+produce a valid share is left out of the key (logged as `op=dkg phase=dispute`), so it
+cannot hold a veto over decryption. The coordinator sees only shares disputed this way. Before shares are sent, the coordinator
+also compares the commitments every keyper received. If one dealer signed two different
+sets, both signed sets are logged as `op=dkg_equivocation` and that dealer is left out of
+the key: every keyper checks the signatures itself, then builds its share and the key from
+the remaining dealers. The excluded keyper stays a committee member and can still decrypt.
+The ceremony stops only if fewer than `t` dealers would remain.
+A keyper never publishes a key unless its own share matches it.
+If publishing is interrupted after any keyper has voted, the coordinator resumes: the
+remaining keypers publish the key they saved at round 2, instead of starting a new
+ceremony that would produce a different key. Keypers keep that key with their secret
+share, so this also works after a keyper restart.
 
 **Tally ordering & bounds.** The tally runs in strict order and only after `voting_end`, enforced at
 every layer: the coordinator drives it only in the `Tallying` state, keypers self-guard, and the data
@@ -372,7 +394,9 @@ election configuration fields or a terminal protocol deadline. A tally that cann
 **`TallyStalled`** badge (a persisted flag; the coordinator is the only writer of "stalled"). It's
 recoverable but **not** self-healing: the persisted flag is authoritative, so a **coordinator
 restart does NOT resume a stalled tally**. The only way out is the **Retry** button on the admin
-panel — the admin wallet signs a `clearTallyStalled`, which the admin service relays; the
+panel — the admin wallet signs a `clearTallyStalled` over the current time, which the admin
+service relays. A retry request is accepted only within 5 minutes of signing and only once,
+so a captured one cannot be replayed later; click Retry again to sign a fresh one. The
 coordinator then resumes with a **fresh 5-attempt budget** (bring the keypers back online first,
 or it just re-stalls). Retry resets the attempt counters, but does not move the
 six-hour limit away from the original voting end; a retry after that limit can

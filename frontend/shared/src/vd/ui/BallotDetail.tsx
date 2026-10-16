@@ -21,11 +21,24 @@ type Props = {
   verifyState: VerifyState;
   onBack: () => void;
   onVerifyLocally: () => void;
+  onToggleGuide: () => void;
+  guideOpen: boolean;
   txHash?: string | null;
   explorerUrl?: string;
+  /** The election's scale: the tally counts each weight divided by it, rounded half-up. */
+  scale?: number;
 };
 
-export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerifyLocally, txHash, explorerUrl }: Props) {
+/** What the tally counts for a held weight: `(w + s/2) / s`, as `scaled_weight` in Python. */
+export function countedWeight(weight: bigint, scale: bigint): bigint {
+  return (weight + scale / 2n) / scale;
+}
+
+export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerifyLocally, onToggleGuide, guideOpen, txHash, explorerUrl, scale = 1 }: Props) {
+  // The credential's exact weight: `ballot.weight` is a JS number, rounded above 2^53.
+  const exactWeight = ballot.attestation ? BigInt(ballot.attestation.weight) : BigInt(ballot.weight);
+  const scaleN = BigInt(scale);
+  const counted = countedWeight(exactWeight, scaleN);
   const { t } = useTranslation();
   const vs = verifyState.status;
   const iconType = vs === "ok" ? "ok" : vs === "bad" ? "bad" : vs === "verifying" ? "checking" : "idle";
@@ -48,8 +61,9 @@ export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerif
       <div className="bdPseudonymRow">
         <span className="dim">counted at weight</span>
         <span className="mono">
-          {ballot.weight.toLocaleString()}
-          {ballot.weight === 1 ? "" : t(" (each point counts {{n}}x)", { n: ballot.weight })}
+          {counted.toLocaleString()}
+          {counted === 1n ? "" : t(" (each point counts {{n}}x)", { n: counted.toLocaleString() })}
+          {scaleN === 1n ? "" : t(" · held {{w}} ÷ scale {{s}}", { w: exactWeight.toLocaleString(), s: scaleN.toLocaleString() })}
         </span>
       </div>
 
@@ -148,9 +162,14 @@ export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerif
             <Hex value={ballot.voterSignature} trim={26} />
           </div>
 
-          <div className="dim">wrAttestation</div>
+          <div className="dim">credential signature</div>
           <div>
-            <Hex value={ballot.wrAttestation} trim={26} />
+            {ballot.attestation ? <Hex value={ballot.attestation.signature} trim={26} /> : <span className="dim">—</span>}
+          </div>
+
+          <div className="dim">credential weight · nonce</div>
+          <div className="mono">
+            {ballot.attestation ? `${ballot.attestation.weight} · ${ballot.attestation.nonce}` : "—"}
           </div>
         </div>
       </div>
@@ -161,8 +180,8 @@ export function BallotDetail({ ballot, globalIndex, verifyState, onBack, onVerif
           <p className="verifyYourselfDesc">
             {t("Don't trust this panel · re-run the same cryptographic check yourself, against this stage's on-chain data, on your own machine.")}
           </p>
-          <button type="button" className="verifyYourselfBtn" onClick={onVerifyLocally}>
-            {t("Open manual verification guide →")}
+          <button type="button" className="verifyYourselfBtn" onClick={onToggleGuide}>
+            {guideOpen ? t("Hide manual guide ↑") : t("Open manual verification guide →")}
           </button>
       </div>
     </div>

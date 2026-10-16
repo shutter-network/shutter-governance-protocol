@@ -175,7 +175,7 @@ records. Storage-specific code lives in its adapters. Services have three roles:
    **blockchain** (web3 over Foundry contracts). All three pass one conformance
    suite. Ballot proofs, signatures and tally checks support independent
    verification. The current implementation still trusts the aggregate returned
-   to keypers at decryption time and has limits in its chain DKG audit reads; see
+   to keypers at decryption time; see
    [the implementation limits below](#current-verification-limits).
 2. **`EligibilityService` port** — issues/verifies `ATTESTATION_V1` over
    `(electionId, pseudonym, vk, weight, nonce)`. Issuance is adapter-specific
@@ -206,14 +206,19 @@ HTTP issuer instead uses a secret-keyed HMAC. See
 >   convenience; left unpinned, a voter can move tokens between wallets and vote twice
 >   with the same balance.
 > - **Issue each voter's correct weight, and enforce eligibility durably** (the bundled
->   reissue/nonce guards are single-process). The protocol accepts any signed weight of 1 or
->   more, so a wrong weight from the issuer is counted as issued. Weights are visible in
->   every ballot, so an auditor can see a wrong one, but the protocol does not reject it.
+>   reissue/nonce guards are single-process). In a weighted election the protocol accepts
+>   any signed weight of 1 or more, so a wrong weight from the issuer is counted as issued.
+>   Weights are visible in every ballot, so an auditor can see a wrong one, but the protocol
+>   does not reject it.
+> - **Issue weight 1 in an unweighted (one per voter) election.** Admission excludes any
+>   other weight there, so a voter given more would lose their ballot. The bundled issuer
+>   reads each election's `weighted` setting through the public API and does this.
 > - **Bind a freshness/expiry (and ideally a one-time nonce) into the wallet challenge**
 >   so a captured signature can't be replayed to mint credentials.
 >
-> The protocol core verifies only the attestation's signature, `weight ≥ 1`, and the
-> bindings. It trusts the issuer for weight correctness by design.
+> The protocol core verifies the attestation's signature, `weight ≥ 1` (exactly 1 in an
+> unweighted election), and the bindings. It trusts the issuer for weight correctness in
+> weighted elections by design.
 
 ### Source layout (`src/shutter_governance_protocol/`)
 
@@ -225,7 +230,7 @@ Layered top-to-bottom so imports flow downward:
 - **`crypto/`** — the BLS12-381 suite (ElGamal-G2, Schnorr-G1, DLEQ/OR/budget
   proofs, Feldman DKG, Lagrange + BSGS recovery).
 - **`envelopes/`** — JSON transport envelopes + byte codecs (the interop contract).
-- **`ports/`** — the abstraction seams (`data_layer`, `eligibility`, `keyper_p2p`).
+- **`ports/`** — the abstraction seams (`data_layer`, `eligibility`).
 - **`adapters/`** — backends behind the ports (`memory`, `db/`, `chain/`, eligibility).
 - **`services/`** — one domain package per actor, each exposing a `__main__` when
   deployable.
@@ -300,11 +305,10 @@ recompute it or verify the underlying quorum signatures at that step. A dishones
 read endpoint could therefore present an individual ballot as the aggregate.
 The adapter's write-time quorum checks do not protect against that behaviour.
 
-The chain adapter's DKG read response omits keyper signatures, so it cannot satisfy
-the Python auditor's signed-submission check. The Python auditor also compares the
-published recovery bound against raw rather than scaled weight in its final
-advisory check; scaled elections can report a discrepancy there even when the
-cryptographic result check succeeds.
+On the chain backend the auditor checks each DKG vote from the transaction that
+cast it, using the keyper's own signature (or, for a vote the keyper sent itself, the
+sender the contract authenticated), so it recounts the key quorum from what the keypers
+actually voted.
 
 ### Trust boundary: the voter's browser
 
@@ -326,9 +330,11 @@ auditor can tell.
   with a DLEQ proof; Lagrange interpolation at zero; baby-step/giant-step recovery.
 - **Proofs:** Fiat-Shamir over a Merlin-style transcript; **keccak256** throughout
   (fixed for cross-language vector compatibility).
-- **Ballot validity:** Variant A (OR proof over `{0..B}`), mode **exact** (`Σ = B`),
-  weighted. Variant B (bit decomposition) and mode **atMost** are specified and
-  test-vectored but deferred in the reference implementation (conformance level 2).
+- **Ballot validity:** Variant A (OR proof over `{0..B}`), weighted, in mode **exact**
+  (`Σ = B`, proved by one DLEQ) or **atMost** (`Σ ≤ B`, proved by a `(B+1)`-branch OR
+  proof over the sum). In atMost a blank ballot (all zeros) is valid: it counts toward
+  turnout and adds no points. Variant B (bit decomposition) is specified and
+  test-vectored but not yet implemented (conformance level 2); registration refuses it.
 
 **Byte-for-byte TS↔Python compatibility is a protocol requirement,** enforced by a
 cross-language conformance-vector suite (not merely a CI convenience). The browser
@@ -366,7 +372,7 @@ src/shutter_governance_protocol/
                        #   aggregation, authz, write_auth
   crypto/              # BLS12-381 crypto suite (ElGamal-G2, Schnorr-G1, proofs, DKG)
   envelopes/           # JSON transport envelopes + codecs
-  ports/               # abstraction seams: data_layer, eligibility, keyper_p2p
+  ports/               # abstraction seams: data_layer, eligibility
   adapters/            # backends behind the ports: memory, db/, chain/, eligibility
   services/            # one domain package per actor: keyper/, coordinator/,
                        #   tally_aggregator/, gateway/, admin/, auditor/, data_layer/

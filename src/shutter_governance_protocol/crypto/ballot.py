@@ -1,6 +1,6 @@
 """Ballot construction, validity-proof codec, and crypto verification.
 
-Variant A / exact mode (conformance level 1). Byte-faithful to
+Variant A, ``exact`` and ``atMost`` modes. Byte-faithful to
 the SDK (``verify.ts``, ``highlevel.ts``, ``codec.ts``): the canonical ballot
 message the voter signs, the transcript seeding shared by prover and verifier,
 and the versioned ``BallotValidityProof`` encoding.
@@ -23,6 +23,7 @@ from shutter_governance_protocol.crypto import proofs, schnorr
 from shutter_governance_protocol.crypto.params import (
     BALLOT_MESSAGE_LABEL,
     BALLOT_PROOF_TRANSCRIPT_LABEL,
+    BUDGET_AT_MOST_TAG,
     BUDGET_EXACT_TAG,
     BVP_VERSION,
     CURVE_ORDER,
@@ -46,11 +47,40 @@ from shutter_governance_protocol.crypto.transcript import Transcript
 
 
 # --------------------------------------------------------------------------- #
-#  BallotValidityProof binary codec (Variant A / exact)
+#  BallotValidityProof binary codec (Variant A)
 # --------------------------------------------------------------------------- #
 
-def encode_ballot_validity_proof(range_proofs: Sequence[Sequence[ORBranch]], e_b: int, z_b: int) -> bytes:
-    """Encode Variant-A / exact validity proof."""
+#: The budget part of a validity proof is ``(e, z)`` of the exact-mode DLEQ, or the
+#: ``budget + 1`` OR branches of the atMost proof over the sum.
+MODES = ("exact", "atMost")
+
+
+def _mode(mode) -> str:
+    # Accepts the config's ``Mode`` (a str enum) or its value.
+    m = getattr(mode, "value", mode)
+    if m not in MODES:
+        raise ValueError(f"unknown budget mode {mode!r}")
+    return m
+
+
+def _encode_branch(out: bytearray, br: ORBranch) -> None:
+    out += g2_to_compressed(br.a1)
+    out += g2_to_compressed(br.a2)
+    out += (br.e % CURVE_ORDER).to_bytes(32, "big")
+    out += (br.z % CURVE_ORDER).to_bytes(32, "big")
+
+
+def _decode_branch(buf: bytes, o: int) -> tuple[ORBranch, int]:
+    a1 = g2_from_compressed(buf[o:o + 96]); o += 96
+    a2 = g2_from_compressed(buf[o:o + 96]); o += 96
+    e = scalar_from_bytes(buf[o:o + 32], "branch e"); o += 32
+    z = scalar_from_bytes(buf[o:o + 32], "branch z"); o += 32
+    return ORBranch(a1, a2, e, z), o
+
+
+def encode_ballot_validity_proof(range_proofs: Sequence[Sequence[ORBranch]], budget_proof) -> bytes:
+    """Encode a Variant-A validity proof. ``budget_proof`` is ``(e, z)`` for exact mode or
+    the list of OR branches for atMost; the budget tag on the wire follows from it."""
     n_outer = len(range_proofs)
     if n_outer == 0:
         raise ValueError("encode_ballot_validity_proof: no range proofs")
@@ -66,18 +96,25 @@ def encode_ballot_validity_proof(range_proofs: Sequence[Sequence[ORBranch]], e_b
         out += branch_count.to_bytes(2, "big")
     for proof in range_proofs:
         for br in proof:
-            out += g2_to_compressed(br.a1)
-            out += g2_to_compressed(br.a2)
-            out += (br.e % CURVE_ORDER).to_bytes(32, "big")
-            out += (br.z % CURVE_ORDER).to_bytes(32, "big")
-    out.append(BUDGET_EXACT_TAG)
-    out += (e_b % CURVE_ORDER).to_bytes(32, "big")
-    out += (z_b % CURVE_ORDER).to_bytes(32, "big")
+            _encode_branch(out, br)
+    if isinstance(budget_proof, tuple):
+        e_b, z_b = budget_proof
+        out.append(BUDGET_EXACT_TAG)
+        out += (e_b % CURVE_ORDER).to_bytes(32, "big")
+        out += (z_b % CURVE_ORDER).to_bytes(32, "big")
+    else:
+        # atMost: the OR branches follow the tag with no count; the decoder knows it is
+        # budget + 1 (``codec.ts``).
+        out.append(BUDGET_AT_MOST_TAG)
+        for br in budget_proof:
+            _encode_branch(out, br)
     return bytes(out)
 
 
 def decode_ballot_validity_proof(buf: bytes, num_candidates: int, budget: int):
-    """Decode Variant-A / exact bytes. Returns ``(range_proofs, e_b, z_b)``."""
+    """Decode Variant-A bytes. Returns ``(range_proofs, budget_proof)``, where
+    ``budget_proof`` is ``(e, z)`` for an exact tag or a list of ``budget + 1`` OR branches
+    for an atMost tag. Which one the election requires is checked by the verifier."""
     if len(buf) < 4:
         raise ValueError("decode_ballot_validity_proof: buffer too short")
     o = 0
@@ -102,23 +139,27 @@ def decode_ballot_validity_proof(buf: bytes, num_candidates: int, budget: int):
     for bc in branch_counts:
         branches = []
         for _ in range(bc):
-            a1 = g2_from_compressed(buf[o:o + 96]); o += 96
-            a2 = g2_from_compressed(buf[o:o + 96]); o += 96
-            e = scalar_from_bytes(buf[o:o + 32], "branch e"); o += 32
-            z = scalar_from_bytes(buf[o:o + 32], "branch z"); o += 32
-            branches.append(ORBranch(a1, a2, e, z))
+            br, o = _decode_branch(buf, o)
+            branches.append(br)
         range_proofs.append(branches)
 
     if o >= len(buf):
         raise ValueError("decode_ballot_validity_proof: truncated before budget tag")
     tag = buf[o]; o += 1
-    if tag != BUDGET_EXACT_TAG:
-        raise ValueError(f"only exact-budget supported (got 0x{tag:02x})")
-    e_b = scalar_from_bytes(buf[o:o + 32], "budget e"); o += 32
-    z_b = scalar_from_bytes(buf[o:o + 32], "budget z"); o += 32
+    if tag == BUDGET_EXACT_TAG:
+        e_b = scalar_from_bytes(buf[o:o + 32], "budget e"); o += 32
+        z_b = scalar_from_bytes(buf[o:o + 32], "budget z"); o += 32
+        budget_proof = (e_b, z_b)
+    elif tag == BUDGET_AT_MOST_TAG:
+        budget_proof = []
+        for _ in range(budget + 1):
+            br, o = _decode_branch(buf, o)
+            budget_proof.append(br)
+    else:
+        raise ValueError(f"unknown budget tag 0x{tag:02x}")
     if o != len(buf):
         raise ValueError(f"{len(buf) - o} trailing bytes after parse")
-    return range_proofs, e_b, z_b
+    return range_proofs, budget_proof
 
 
 # --------------------------------------------------------------------------- #
@@ -205,14 +246,14 @@ def _pre_v1_ballot_message(election_id: bytes, pseudonym: bytes,
 
 
 def seed_ballot_transcript(election_id: bytes, mpk, vk, ciphertexts_pts, *,
-                           num_candidates: int, budget: int) -> Transcript:
-    """Seed the shared prover/verifier transcript (Variant A / exact)."""
+                           num_candidates: int, budget: int, mode) -> Transcript:
+    """Seed the shared prover/verifier transcript (Variant A)."""
     t = Transcript(BALLOT_PROOF_TRANSCRIPT_LABEL)
     t.append("electionId", election_id)
     t.append_point("mpk", mpk)
     t.append("vk", g1_to_compressed(vk))  # vk is G1
     t.append("variant", b"\x41")
-    t.append("mode", b"\x00")
+    t.append("mode", b"\x00" if _mode(mode) == "exact" else b"\x01")
     t.append("numCandidates", num_candidates.to_bytes(2, "big"))
     t.append("budget", budget.to_bytes(2, "big"))
     t.append("|cts|", len(ciphertexts_pts).to_bytes(2, "big"))
@@ -223,7 +264,7 @@ def seed_ballot_transcript(election_id: bytes, mpk, vk, ciphertexts_pts, *,
 
 
 # --------------------------------------------------------------------------- #
-#  build_ballot (Variant A / exact)
+#  build_ballot (Variant A)
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -238,10 +279,11 @@ class BuiltBallot:
 
 
 def build_ballot(*, mpk, election_id: bytes, pseudonym: bytes, sk: int, vk, attestation,
-                 votes: Sequence[int], num_candidates: int, budget: int,
+                 votes: Sequence[int], num_candidates: int, budget: int, mode="exact",
                  rs=None, range_proof_w=None, range_proof_sims=None,
-                 budget_proof_w=None, schnorr_k=None) -> BuiltBallot:
-    """Build a Variant-A / exact ballot (mirrors ``highlevel.ts:buildBallot``).
+                 budget_proof_w=None, budget_proof_sims=None, schnorr_k=None) -> BuiltBallot:
+    """Build a Variant-A ballot (mirrors ``highlevel.ts:buildBallot``). ``mode`` is the
+    election's: ``exact`` needs Σvotes == budget, ``atMost`` needs Σvotes <= budget.
 
     Randomness stays inside this function; optional pinned
     randomness reproduces fixtures. Does NOT create the eligibility attestation —
@@ -253,8 +295,12 @@ def build_ballot(*, mpk, election_id: bytes, pseudonym: bytes, sk: int, vk, atte
     for j, v in enumerate(votes):
         if v < 0 or v > budget:
             raise ValueError(f"vote[{j}] = {v} not in [0, {budget}]")
-    if sum(int(v) for v in votes) != budget:
-        raise ValueError(f"exact mode requires Σvotes == {budget}, got {sum(votes)}")
+    mode = _mode(mode)
+    spent = sum(int(v) for v in votes)
+    if mode == "exact" and spent != budget:
+        raise ValueError(f"exact mode requires Σvotes == {budget}, got {spent}")
+    if mode == "atMost" and spent > budget:
+        raise ValueError(f"atMost mode requires Σvotes <= {budget}, got {spent}")
     if schnorr.keygen(sk)[1] != vk:
         raise ValueError("build_ballot: vk does not match sk·P1 (mismatched keypair)")
 
@@ -269,7 +315,7 @@ def build_ballot(*, mpk, election_id: bytes, pseudonym: bytes, sk: int, vk, atte
 
     # 2. Seed transcript.
     t = seed_ballot_transcript(election_id, mpk, vk, cts_pts,
-                               num_candidates=num_candidates, budget=budget)
+                               num_candidates=num_candidates, budget=budget, mode=mode)
 
     # 3. Per-candidate range OR proof.
     candidates = list(range(budget + 1))
@@ -284,17 +330,23 @@ def build_ballot(*, mpk, election_id: bytes, pseudonym: bytes, sk: int, vk, atte
         )
         range_proofs.append(proof)
 
-    # 4. Homomorphic sum + exact-budget proof.
+    # 4. Homomorphic sum + budget proof. The "ballot:budget" label byte is 0 in both
+    #    modes (``highlevel.ts``); the mode is bound by the transcript seed and by
+    #    ``bind_budget`` inside the proof.
     c1_sum, c2_sum = Z2, Z2
     for c1, c2 in cts_pts:
         c1_sum = add(c1_sum, c1)
         c2_sum = add(c2_sum, c2)
     r_sum = sum(rs_used) % CURVE_ORDER
     t.append("ballot:budget", b"\x00")
-    e_b, z_b = proofs.prove_budget_exact(c1_sum, c2_sum, mpk, budget, r_sum, t, w=budget_proof_w)
+    if mode == "exact":
+        budget_proof = proofs.prove_budget_exact(c1_sum, c2_sum, mpk, budget, r_sum, t, w=budget_proof_w)
+    else:
+        budget_proof = proofs.prove_budget_at_most(c1_sum, c2_sum, mpk, budget, r_sum, spent, t,
+                                                   w=budget_proof_w, simulated=budget_proof_sims)
 
     # 5. Encode proof, canonicalize, Schnorr-sign.
-    zk_proof = encode_ballot_validity_proof(range_proofs, e_b, z_b)
+    zk_proof = encode_ballot_validity_proof(range_proofs, budget_proof)
     ct_bytes = [(g2_to_compressed(c1), g2_to_compressed(c2)) for (c1, c2) in cts_pts]
     preimage = canonical_ballot_message(election_id, pseudonym, ct_bytes, zk_proof, attestation)
     R, s = schnorr.sign(sk, vk, keccak(preimage), k=schnorr_k)
@@ -316,14 +368,22 @@ def build_ballot(*, mpk, election_id: bytes, pseudonym: bytes, sk: int, vk, atte
 def verify_ballot_crypto(*, mpk, election_id: bytes, pseudonym: bytes, vk_bytes: bytes,
                          ciphertext_bytes: Sequence[tuple[bytes, bytes]], zk_proof: bytes,
                          voter_signature: bytes, attestation, num_candidates: int,
-                         budget: int) -> tuple[bool, str | None]:
+                         budget: int, mode) -> tuple[bool, str | None]:
     """Verify range/budget proofs and the Schnorr signature.
+
+    ``mode`` is the election's (``exact`` / ``atMost``). The budget proof on the wire
+    must be of that mode, as the SDK requires; a ballot proving the other mode is
+    ``MALFORMED`` even where its arithmetic would hold in both (Σvotes == budget).
 
     Returns ``(ok, reason)`` where ``reason`` is ``None`` on success or one of
     ``"MALFORMED"`` / ``"INVALID_PROOF"`` / ``"INVALID_SIGNATURE"`` — matching the
     exclusion-reason vocabulary. Attestation validity is verified separately.
     """
     if not (1 <= num_candidates <= 0xFFFF):
+        return False, "MALFORMED"
+    try:
+        mode = _mode(mode)
+    except ValueError:
         return False, "MALFORMED"
     # 0xFFFE, not 0xFFFF: the proof encodes ``branch_count = budget + 1`` as two bytes
     # big-endian, so budget = 0xFFFF makes branch_count 0x10000 and
@@ -353,12 +413,14 @@ def verify_ballot_crypto(*, mpk, election_id: bytes, pseudonym: bytes, vk_bytes:
             return False, "MALFORMED"
 
     try:
-        range_proofs, e_b, z_b = decode_ballot_validity_proof(zk_proof, num_candidates, budget)
+        range_proofs, budget_proof = decode_ballot_validity_proof(zk_proof, num_candidates, budget)
     except Exception:  # noqa: BLE001
         return False, "MALFORMED"
+    if isinstance(budget_proof, tuple) != (mode == "exact"):
+        return False, "MALFORMED"  # budget proof of the other mode
 
     t = seed_ballot_transcript(election_id, mpk, vk, cts_pts,
-                               num_candidates=num_candidates, budget=budget)
+                               num_candidates=num_candidates, budget=budget, mode=mode)
     candidates = list(range(budget + 1))
     for j in range(num_candidates):
         t.append("ballot:range", j.to_bytes(2, "big"))
@@ -371,15 +433,25 @@ def verify_ballot_crypto(*, mpk, election_id: bytes, pseudonym: bytes, vk_bytes:
         c1_sum = add(c1_sum, c1)
         c2_sum = add(c2_sum, c2)
     t.append("ballot:budget", b"\x00")
-    if not proofs.verify_budget_exact(c1_sum, c2_sum, mpk, budget, e_b, z_b, t):
+    if mode == "exact":
+        e_b, z_b = budget_proof
+        budget_ok = proofs.verify_budget_exact(c1_sum, c2_sum, mpk, budget, e_b, z_b, t)
+    else:
+        budget_ok = proofs.verify_budget_at_most(c1_sum, c2_sum, mpk, budget, budget_proof, t)
+    if not budget_ok:
         return False, "INVALID_PROOF"
 
     try:
         R, s = schnorr.decode(voter_signature)
     except Exception:  # noqa: BLE001
         return False, "MALFORMED"
-    preimage = canonical_ballot_message(election_id, pseudonym, ciphertext_bytes, zk_proof,
-                                       attestation)
+    # Stored ballots are untrusted, so a credential that cannot be encoded (a weight or
+    # nonce too large for its 32-byte field) must be excluded, not crash the tally.
+    try:
+        preimage = canonical_ballot_message(election_id, pseudonym, ciphertext_bytes, zk_proof,
+                                           attestation)
+    except (ValueError, OverflowError):
+        return False, "MALFORMED"
     if not schnorr.verify(vk, keccak(preimage), R, s):
         # Name a format mismatch as one. A v1 signature does not fail informatively
         # against v2 -- ``schnorr.verify`` just returns False, which reads as "wrong

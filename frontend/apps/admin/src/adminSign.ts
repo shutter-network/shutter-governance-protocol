@@ -66,15 +66,23 @@ function framed(bytes: Uint8Array): Uint8Array[] {
   return [u32be(bytes.length), bytes];
 }
 
-/** request_digest(op, eid, payload=empty). `eid` is the canonical 0x-hex 32-byte election
+/** request_digest(op, eid, payload). `eid` is the canonical 0x-hex 32-byte election
  * id (accepts a plain string; @shutter-governance-protocol/shared's Hex is `string`). */
-function requestDigest(op: string, eid: string): Hex {
+function requestDigest(op: string, eid: string, payload: Uint8Array = new Uint8Array(0)): Hex {
   return keccak256(concat([
     stringToBytes(REQUEST_DST),
     ...framed(stringToBytes(op)),
     ...framed(hexToBytes(eid as `0x${string}`)),
-    ...framed(new Uint8Array(0)),   // no payload for cancel / tally_resume
+    ...framed(payload),
   ]));
+}
+
+/** authz.request_nonce_payload: the signing time as 8 bytes, big-endian unsigned seconds. */
+export function requestNoncePayload(issuedAt: number): Uint8Array {
+  if (!Number.isSafeInteger(issuedAt) || issuedAt < 0) throw new Error(`bad issuedAt: ${issuedAt}`);
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setBigUint64(0, BigInt(issuedAt), false); // false = big-endian
+  return b;
 }
 
 /** request_digest("cancel", eid). */
@@ -82,9 +90,12 @@ export function cancelDigest(eid: string): Hex {
   return requestDigest("cancel", eid);
 }
 
-/** request_digest("tally_resume", eid) — the admin's "retry" signature that clears a
- * stalled tally so the coordinator resumes. */
-export function retryTallyDigest(eid: string): Hex {
-  return requestDigest("tally_resume", eid);
+/** request_digest("tally_resume", eid, request_nonce_payload(issuedAt)) — the admin's
+ * "retry" signature that clears a stalled tally so the coordinator resumes. It binds the
+ * signing time, so the service accepts it only while fresh (±300 s) and only once: a
+ * captured retry cannot be replayed to un-stall the tally again later. Send the same
+ * `issuedAt` alongside the signature. */
+export function retryTallyDigest(eid: string, issuedAt: number): Hex {
+  return requestDigest("tally_resume", eid, requestNoncePayload(issuedAt));
 }
 

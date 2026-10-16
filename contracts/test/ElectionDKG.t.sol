@@ -194,6 +194,56 @@ contract ElectionDKGTest is Test {
         }
     }
 
+    // -- DKG closes when voting opens ------------------------------------------- //
+
+    /// A vote at or after votingStart used to be accepted, so a late vote could finalize
+    /// the key of an election that had already failed for lack of one.
+    function test_voteDKGResultRejectedOnceVotingStarted() external {
+        vm.prank(keyper1);
+        election.voteDKGResult(_g2Point(1), _committeePKs(10));
+
+        vm.warp(100); // votingStart
+        vm.prank(keyper2);
+        vm.expectRevert(abi.encodeWithSelector(ElectionBase.DKGClosed.selector, 100));
+        election.voteDKGResult(_g2Point(1), _committeePKs(10));
+        assertFalse(election.isDKGFinalized());
+    }
+
+    // -- config checks ------------------------------------------------------------ //
+
+    function test_constructorRejectsUnknownEnumValues() external {
+        VotingTypes.ElectionParams memory p = _params();
+        p.mode = 2;
+        vm.expectRevert(ElectionBase.InvalidConfig.selector);
+        new Election(owner, 2, keyperSet, p);
+
+        p = _params();
+        p.variant = 2;
+        vm.expectRevert(ElectionBase.InvalidConfig.selector);
+        new Election(owner, 2, keyperSet, p);
+
+        p = _params();
+        p.duplicatePolicy = 2;
+        vm.expectRevert(ElectionBase.InvalidConfig.selector);
+        new Election(owner, 2, keyperSet, p);
+    }
+
+    function test_weiScaleIsStored() external {
+        VotingTypes.ElectionParams memory p = _params();
+        p.weighted = true;
+        p.scale = 1e15; // wei-denominated token weights; does not fit uint32
+        Election e = new Election(owner, 2, keyperSet, p);
+        assertEq(e.scale(), 1e15);
+        (VotingTypes.ElectionConfigView memory cfg,) = e.getElection();
+        assertEq(cfg.scale, 1e15);
+    }
+
+    function test_deployBlockIsRecorded() external {
+        vm.roll(1234);
+        Election later = new Election(owner, 2, keyperSet, _params());
+        assertEq(later.deployBlock(), 1234);
+    }
+
     function _params() private view returns (VotingTypes.ElectionParams memory) {
         return VotingTypes.ElectionParams({
             mode: 0, variant: 0, weighted: false, scale: 1, duplicatePolicy: 1, protocolVersion: "v1",

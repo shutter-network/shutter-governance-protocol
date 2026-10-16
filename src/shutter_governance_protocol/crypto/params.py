@@ -60,7 +60,6 @@ VARIANT_A_BYTE = 0x41  # 'A'
 VARIANT_B_BYTE = 0x42  # 'B' (conformance level 2)
 BUDGET_EXACT_TAG = 0x00
 BUDGET_AT_MOST_TAG = 0x01
-BRANCH_SIZE = 2 * G2_BYTES + 2 * SCALAR_BYTES  # 256: a1 || a2 || e || z
 
 
 # --------------------------------------------------------------------------- #

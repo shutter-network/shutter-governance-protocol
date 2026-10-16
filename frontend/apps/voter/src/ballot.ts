@@ -57,8 +57,9 @@ export function ensureCurves(): Promise<void> {
   return curvesReady;
 }
 
-/** The wire credential (hex, optional nonce) as the SDK's byte-and-bigint shape. */
-function toSdkAttestation(a: AttestationJson): Attestation {
+/** The wire credential (hex, optional nonce) as the SDK's byte-and-bigint shape. Weight
+ *  and nonce arrive as decimal strings so `BigInt` gets them exactly; exported for tests. */
+export function toSdkAttestation(a: AttestationJson): Attestation {
   return {
     electionId: hexToBytes(a.electionId),
     pseudonym: hexToBytes(a.pseudonym),

@@ -129,7 +129,7 @@ def test_retry_tally_clears_stalled_flag_admin_only():
     dl = InMemoryDataLayer(clock=clock)
     cfg = _config(admin, result_publisher=publisher)
     eid = dl.register_election(cfg, admin.sign_register(cfg))
-    c = build_admin_app(dl, admin.identity, clock=lambda: 0).test_client()
+    c = build_admin_app(dl, admin.identity, clock=clock).test_client()
 
     clock.set(2_500)  # past voting_end
     stall(dl, eid, publisher, 2_500)  # coordinator marks it
@@ -151,3 +151,58 @@ def test_retry_tally_clears_stalled_flag_admin_only():
                      "issuedAt": 2_502})
     assert r.status_code == 401
     assert dl.get_election(eid).tally_stalled is True
+
+
+# --------------------------------------------------------------------------- #
+#  Retry requests are fresh and single-use at the admin service itself
+# --------------------------------------------------------------------------- #
+
+def _stalled_election(dl_cls=InMemoryDataLayer):
+    admin, publisher = Signer.generate(), Signer.generate()
+    clock = ManualClock(0)
+    dl = dl_cls(clock=clock)
+    cfg = _config(admin, result_publisher=publisher)
+    eid = dl.register_election(cfg, admin.sign_register(cfg))
+    clock.set(2_500)
+    stall(dl, eid, publisher, 2_500)
+    return admin, publisher, clock, dl, eid, build_admin_app(dl, admin.identity, clock=clock).test_client()
+
+
+def _retry(c, admin, eid, issued_at):
+    sig = admin.sign("tally_resume", eid, authz.request_nonce_payload(issued_at))
+    return c.post(f"/elections/{eid.hex()}/tally/retry",
+                  json={"signature": codecs.enc_bytes(sig), "issuedAt": issued_at})
+
+
+def test_retry_missing_issued_at_is_400_not_404():
+    """The browser used to send only a signature; the missing field reached the KeyError
+    handler and came back as "No election found with that id."."""
+    admin, _, _, _, eid, c = _stalled_election()
+    sig = admin.sign("tally_resume", eid)  # the old empty-payload signature
+    r = c.post(f"/elections/{eid.hex()}/tally/retry", json={"signature": codecs.enc_bytes(sig)})
+    assert r.status_code == 400 and "issuedAt" in r.get_json()["message"]
+
+
+def test_retry_outside_the_freshness_window_is_rejected():
+    admin, _, _, dl, eid, c = _stalled_election()
+    assert _retry(c, admin, eid, 2_500 - authz.REQUEST_FRESHNESS_S - 1).status_code == 401
+    assert dl.get_election(eid).tally_stalled is True
+
+
+class _ChainLikeDataLayer(InMemoryDataLayer):
+    """Like the chain adapter: clears the stall without checking the signature or issued_at."""
+
+    def set_tally_stalled(self, election_id, stalled, sig, issued_at):
+        self._get(election_id).tally_stalled = stalled
+
+
+def test_retry_cannot_be_replayed_even_when_the_data_layer_checks_nothing():
+    """On chain the admin service is the only gate: a captured retry used to be accepted
+    again after every later stall, spending the admin's gas each time."""
+    admin, publisher, clock, dl, eid, c = _stalled_election(_ChainLikeDataLayer)
+    assert _retry(c, admin, eid, 2_500).status_code == 204
+    dl._get(eid).tally_stalled = True  # the coordinator stalls it again
+    r = _retry(c, admin, eid, 2_500)   # the same request, replayed
+    assert r.status_code == 401 and "already been used" in r.get_json()["message"]
+    assert dl.get_election(eid).tally_stalled is True
+    assert _retry(c, admin, eid, 2_501).status_code == 204  # a freshly signed retry still works

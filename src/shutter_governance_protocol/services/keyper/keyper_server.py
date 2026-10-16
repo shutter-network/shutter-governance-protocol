@@ -40,8 +40,15 @@ import requests
 from flask import Flask, abort, jsonify, request
 
 from shutter_governance_protocol.core import write_auth
-from shutter_governance_protocol.crypto.dkg import KeyperDKGState, derive_joint_mpk, derive_mpk_share
+from shutter_governance_protocol.crypto.dkg import (
+    KeyperDKGState,
+    committee_keys,
+    derive_joint_mpk,
+    derive_mpk_share,
+    qualified,
+)
 from shutter_governance_protocol.crypto.dkg import verify_share as dkg_verify_share
+from shutter_governance_protocol.crypto.params import CURVE_ORDER
 from shutter_governance_protocol.crypto.points import g2_from_compressed, g2_to_compressed
 from shutter_governance_protocol.ports.data_layer import ImmutabilityError
 from shutter_governance_protocol.services.common.auth import tokens_equal
@@ -271,11 +278,25 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         # threshold.t IS the quorum; round1 derives the degree from it.
         n, quorum = config.threshold.n, config.threshold.quorum
         with lock:
+            # A fresh round 1 draws a new polynomial, so it would replace the secret for a
+            # key this keyper has already voted for. Votes are append-only, so that key
+            # could then never be decrypted and this keyper could never vote for the new
+            # one. The coordinator resumes with /dkg/publish instead.
+            entry = completed.get(eid_hex)
+            if entry is not None and entry.published:
+                log.warning("op=dkg phase=round1 status=refused election=%s reason=already_published", eid_hex)
+                abort(409, "this keyper already published a key for this election; resume with /dkg/publish")
+            if entry is not None:
+                # Unpublished key from an earlier attempt: drop it, or a later resume could
+                # publish a key no other keyper holds if this attempt's round 2 fails.
+                del completed[eid_hex]
+                persist.save_dkg_secrets(fernet, completed, state_dir)
             st = KeyperDKGState()
             st.round1(idx, n, quorum)
             dkg_states[eid_hex] = st
             _inbox(eid_hex)  # reset/init
-            inbox[eid_hex] = {"commitments": {idx: st.commitments}, "shares": {idx: st.shares_for_others[idx]}}
+            inbox[eid_hex] = {"commitments": {idx: st.commitments}, "shares": {idx: st.shares_for_others[idx]},
+                              "session": bytes.fromhex(str(body.get("session") or ""))}
         return jsonify(ok=True, index=idx)
 
     @app.post("/dkg/distribute_commitments")
@@ -288,7 +309,11 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         commitments_hex = [c.hex() for c in commitments_c]
         # Sign the commitments so a recipient can bind them to this dealer's member
         # address (defeats a peer injecting forged commitments for another dealer).
-        sig = write_auth.sign_digest(signer.private_key, write_auth.dkg_commitments_digest(eid, idx, commitments_c))
+        session = _inbox(eid_hex).get("session", b"")
+        sig = write_auth.sign_digest(signer.private_key,
+                                     write_auth.dkg_commitments_digest(eid, idx, commitments_c, session))
+        with lock:
+            _inbox(eid_hex).setdefault("commitment_sigs", {})[idx] = "0x" + sig.hex()
         for peer_index in range(1, config.threshold.n + 1):
             if peer_index == idx:
                 continue
@@ -310,7 +335,8 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         try:
             sig = bytes.fromhex(str(body["signature"]).removeprefix("0x"))
             ok = dealer_addr is not None and \
-                write_auth.recover_digest(write_auth.dkg_commitments_digest(eid, dealer, incoming), sig) == dealer_addr
+                write_auth.recover_digest(write_auth.dkg_commitments_digest(
+                    eid, dealer, incoming, _inbox(eid_hex).get("session", b"")), sig) == dealer_addr
         except (KeyError, ValueError, TypeError):
             ok = False
         if not ok:
@@ -337,7 +363,27 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
                     abort(409, "different commitments already received from this dealer")
             else:
                 box[dealer] = [g2_from_compressed(b) for b in incoming]
+                # Kept as evidence: the coordinator compares every keyper's copy, and two
+                # different vectors signed by one dealer prove it equivocated.
+                _inbox(eid_hex).setdefault("commitment_sigs", {})[dealer] = "0x" + sig.hex()
         return jsonify(ok=True)
+
+    @app.post("/dkg/commitments")
+    def dkg_commitments():
+        """Every dealer's commitments as this keyper received them, with the dealer's
+        signature. Commitments are public; this lets the coordinator check that every
+        keyper holds the same ones before any share is combined."""
+        body = request.get_json(force=True)
+        eid_hex = _eid(body).hex()
+        with lock:
+            box = _inbox(eid_hex)
+            sigs = box.get("commitment_sigs", {})
+            held = {
+                str(dealer): {"commitments": [g2_to_compressed(c).hex() for c in comms],
+                              "signature": sigs.get(dealer)}
+                for dealer, comms in box["commitments"].items()
+            }
+        return jsonify(commitments=held)
 
     @app.post("/dkg/distribute_shares")
     def dkg_distribute_shares():
@@ -443,6 +489,112 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
             box.setdefault("share_sigs", {})[dealer] = sig_hex
         return jsonify(ok=True)
 
+    def _verified_exclusions(eid: bytes, config, requested: list) -> set[int]:
+        """Dealers to leave out of the key, each checked against its evidence here.
+
+        The coordinator proposes exclusions, but a keyper applies one only after verifying
+        the evidence itself, so the coordinator cannot drop an honest dealer by assertion.
+        Every keyper receives the same list; one that disagrees refuses (400) rather than
+        silently deriving a different key. At least ``t`` dealers must remain: with fewer
+        than ``t`` dishonest keypers, that keeps at least one honest dealer's randomness in
+        the key, so the dishonest ones cannot know it.
+        """
+        out: set[int] = set()
+        for item in requested:
+            try:
+                dealer, reason = int(item["dealer"]), str(item["reason"])
+            except (KeyError, TypeError, ValueError):
+                abort(400, "malformed exclusion")
+            addr = _members_addr(config, dealer)
+            if reason == "equivocation":
+                proven = addr is not None and \
+                    write_auth.proves_equivocation(eid, dealer, addr, item.get("evidence") or [],
+                                                   _inbox(eid.hex()).get("session", b""))
+            elif reason == "no_valid_reveal":
+                # Not a proof that the dealer cheated, only a signed accusation it failed to
+                # answer. That is enough: excluding a dealer drops only its contribution to
+                # the key, and at least `t` dealers remain (checked below), so the key keeps
+                # an honest dealer's randomness even if the accusation was false.
+                proven = addr is not None and _is_member_accusation(eid, config, dealer, item.get("accusation"))
+            else:
+                proven = False
+            if not proven:
+                log.warning("op=dkg phase=round2 status=refused election=%s dealer=%s reason=unproven_exclusion",
+                            eid.hex(), item.get("dealer"))
+                abort(400, f"exclusion of dealer {dealer} is not backed by valid evidence")
+            out.add(dealer)
+        if config.threshold.n - len(out) < config.threshold.quorum:
+            abort(409, "too many dealers excluded: fewer than the threshold would remain")
+        if out:
+            log.warning("op=dkg phase=round2 status=excluding election=%s dealers=%s", eid.hex(), sorted(out))
+        return out
+
+    def _is_member_accusation(eid: bytes, config, dealer: int, acc) -> bool:
+        """Whether ``acc`` is a committee member's signed accusation of ``dealer`` for ``eid``."""
+        try:
+            recipient = int(acc["recipientIndex"])
+            sig = bytes.fromhex(str(acc["signature"]).removeprefix("0x"))
+            ok = (str(acc["electionId"]) == eid.hex() and int(acc["accusedDealerIndex"]) == dealer
+                  and recipient != dealer)
+            member = _members_addr(config, recipient)
+            return ok and member is not None and \
+                write_auth.recover_digest(write_auth.dkg_accusation_digest(eid, dealer, recipient), sig) == member
+        except Exception:  # noqa: BLE001 — malformed accusation
+            return False
+
+    def _adopt_agreed_commitments(eid: bytes, config, box: dict, my_idx: int, agreed: dict) -> None:
+        """Hold exactly the commitments every keyper agreed on, each checked against its
+        dealer's signature for this session.
+
+        A dealer could otherwise withhold its commitments from one keyper (which then can
+        never accept a revealed share), or send it a second vector after the coordinator's
+        equivocation check, so that keyper ends up on a different key.
+        """
+        session = box.get("session", b"")
+        for dealer_s, row in agreed.items():
+            try:
+                dealer = int(dealer_s)
+                vector = [bytes.fromhex(h) for h in row["commitments"]]
+                sig = bytes.fromhex(str(row["signature"]).removeprefix("0x"))
+                addr = _members_addr(config, dealer)
+                ok = (dealer != my_idx and addr is not None and len(vector) == config.threshold.quorum
+                      and write_auth.recover_digest(
+                          write_auth.dkg_commitments_digest(eid, dealer, vector, session), sig) == addr)
+                points = [g2_from_compressed(b) for b in vector] if ok else None
+            except Exception:  # noqa: BLE001 — malformed: ignored, round 2 then complains
+                ok = False
+            if not ok:
+                continue
+            with lock:
+                box["commitments"][dealer] = points
+                box.setdefault("commitment_sigs", {})[dealer] = row["signature"]
+
+    def _accept_revealed_shares(eid: bytes, config, box: dict, my_idx: int, revealed: list) -> None:
+        """Store shares a dealer revealed publicly for this keyper, after checking them.
+
+        Each must carry the dealer's signature over (election, dealer, this keyper, share)
+        and pass the Feldman check against the commitments this keyper holds, so the
+        coordinator relaying it cannot substitute a share of its own.
+        """
+        for item in revealed:
+            try:
+                dealer, share = int(item["dealer"]), int(str(item["share"]), 16)
+                sig = bytes.fromhex(str(item["signature"]).removeprefix("0x"))
+                comms = box["commitments"].get(dealer)
+                ok = (0 <= share < CURVE_ORDER and comms is not None
+                      and write_auth.recover_digest(write_auth.dkg_share_digest(eid, dealer, my_idx, share), sig)
+                      == _members_addr(config, dealer)
+                      and dkg_verify_share(comms, my_idx, share))
+            except Exception:  # noqa: BLE001 — malformed: ignored like an invalid one
+                ok = False
+            if not ok:
+                log.warning("op=dkg phase=round2 status=revealed_share_rejected election=%s dealer=%s",
+                            eid.hex(), item.get("dealer"))
+                continue
+            with lock:
+                box["shares"][dealer] = share
+            log.info("op=dkg phase=round2 status=revealed_share_accepted election=%s dealer=%d", eid.hex(), dealer)
+
     @app.post("/dkg/round2")
     def dkg_round2():
         body = request.get_json(force=True)
@@ -451,8 +603,13 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         st = dkg_states[eid_hex]
         box = _inbox(eid_hex)
         my_idx = _my_index(config)
+        excluded = _verified_exclusions(eid, config, body.get("excluded") or [])
+        _adopt_agreed_commitments(eid, config, box, my_idx, body.get("agreed") or {})
+        _accept_revealed_shares(eid, config, box, my_idx, body.get("revealed") or [])
+        n, quorum = config.threshold.n, config.threshold.quorum
+        dealers = [d for d in range(1, n + 1) if d not in excluded]
         try:
-            st.round2(box["commitments"], box["shares"])
+            st.round2(box["commitments"], box["shares"], dealers=dealers)
         except ValueError as err:
             bad = getattr(err, "bad_dealers", [])
             # Security-relevant: this keyper's VSS verification rejected a dealer's shares.
@@ -480,11 +637,25 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
                 for bad_dealer in bad
             ]
             return jsonify(verified=False, complaints=bad, accusations=accusations), 200
+        # Fix the key here, next to the secret it belongs to, so every later publish (a
+        # retry, or after a restart that lost the in-memory inbox) sends the same one.
+        commitments = qualified(box["commitments"], excluded)
+        pk_b = g2_to_compressed(derive_joint_mpk(commitments, quorum))
+        committee_b = tuple(g2_to_compressed(c) for c in committee_keys(n, commitments, quorum))
+        # Never vote for a key this keyper cannot decrypt under: its own entry in the
+        # published committee keys must be the public half of the secret it just formed.
+        # Round 2 should already guarantee this; the check makes sure no future path can
+        # break it silently, since the mismatch would otherwise surface only at tally.
+        if g2_to_compressed(derive_mpk_share(my_idx, commitments, quorum)) != g2_to_compressed(st.public_key_share):
+            log.error("op=dkg phase=round2 status=self_check_failed election=%s keyper=%d", eid_hex, my_idx)
+            return jsonify(verified=False, complaints=[], accusations=[]), 200
         with lock:
             completed[eid_hex] = persist.DkgEntry(
                 combined_share=st.combined_share,
                 expires_at=(int(config.voting_end) + _SECRET_RETENTION_S
                             if _SECRET_RETENTION_S is not None else None),
+                pk_election=pk_b,
+                committee_pks=committee_b,
             )
             persist.save_dkg_secrets(fernet, completed, state_dir)
         return jsonify(verified=True)
@@ -519,6 +690,19 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         except _AccusationDenied as denied:
             return jsonify(error="unauthorized" if denied.status == 401 else denied.reason), denied.status
 
+        if body.get("public"):
+            # Last step of a dispute the sealed re-send did not settle: hand the share,
+            # signed, to the coordinator, which checks it against this dealer's agreed
+            # commitments and forwards it to the accuser. A dealer that cannot produce a
+            # valid share here is excluded from the key. Only the accuser was entitled to
+            # this share; see run_dkg_http for why disclosing it is acceptable.
+            share_val = st.shares_for_others[recipient]
+            sig = write_auth.sign_digest(
+                signer.private_key, write_auth.dkg_share_digest(eid, my_idx, recipient, share_val))
+            log.warning("op=dkg phase=reveal_share status=revealed_public election=%s dealer=%s recipient=%s",
+                        eid_hex, my_idx, recipient)
+            return jsonify(ok=True, dealerIndex=my_idx, recipientIndex=recipient,
+                           share=hex(share_val), signature="0x" + sig.hex())
         enc_pub = _verified_peer_enc_key(config, eid_hex, recipient, "reveal_share")
         _seal_and_send_share(eid, eid_hex, my_idx, recipient, st, enc_pub)
         # A genuine disclosure — significant security event; record the who/what.
@@ -587,17 +771,26 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         # whatever commitments happened to be in its inbox and submit it, even though it
         # holds no combined share for that key. If such a key reached the t+1 quorum the
         # election would finalize with a key nobody can decrypt.
-        if eid_hex not in completed:
+        entry = completed.get(eid_hex)
+        if entry is None:
             log.warning("op=dkg phase=publish status=refused election=%s reason=round2_not_completed", eid_hex)
             abort(409, "round 2 has not completed for this election; refusing to publish a key")
-        commitments = _inbox(eid_hex)["commitments"]
-        quorum = _config(eid).threshold.quorum
-        pk = derive_joint_mpk(commitments, quorum)
-        committee = [derive_mpk_share(i, commitments, quorum) for i in sorted(commitments)]
-        pk_b = g2_to_compressed(pk)
-        committee_b = [g2_to_compressed(c) for c in committee]
+        if entry.pk_election is None:
+            # Completed by an older version, which did not record the key; derive it from
+            # the in-memory commitments as that version did.
+            commitments = _inbox(eid_hex)["commitments"]
+            quorum = _config(eid).threshold.quorum
+            entry.pk_election = g2_to_compressed(derive_joint_mpk(commitments, quorum))
+            entry.committee_pks = tuple(g2_to_compressed(c)
+                                        for c in committee_keys(_config(eid).threshold.n, commitments, quorum))
+        pk_b, committee_b = entry.pk_election, list(entry.committee_pks)
         sig = write_auth.sign_dkg_result(signer.private_key, eid, pk_b, committee_b)
+        # Re-sending the same vote is a no-op on every backend, so this is safe to retry.
         submitter.submit_dkg_result(eid, pk_b, committee_b, sig)  # direct or via coordinator relay
+        with lock:
+            if not entry.published:
+                entry.published = True
+                persist.save_dkg_secrets(fernet, completed, state_dir)
         # Now — and not at the end of round 2 — drop the dealing material. The complaint
         # window is closed once we are publishing, so no recipient can still need a re-deal
         # from us. `combined_share` is untouched: decryption needs it.

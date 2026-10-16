@@ -111,13 +111,15 @@ contract ElectionMetaTxTest is Test {
         vm.prank(relayer);
         election.submitAggregateSigned(agg, _signAggregate(K1_PK, agg));
 
-        vm.expectRevert(ElectionBase.AggregateNotPublished.selector);
-        election.getAggregate();
+        assertEq(election.aggregateDigest(), bytes32(0)); // not canonical yet
 
-        // keyper2's identical signed aggregate reaches the t+1 quorum.
+        // keyper2's identical signed aggregate reaches the quorum.
         vm.prank(relayer);
         election.submitAggregateSigned(agg, _signAggregate(K2_PK, agg));
-        assertEq(election.getAggregate().aggregates.length, 3);
+        assertEq(
+            election.aggregateDigest(),
+            keccak256(abi.encodePacked("SHUTTER-GOVERNANCE-PROTOCOL-AGGREGATE-v1", election.electionId(), abi.encode(agg)))
+        );
     }
 
     function test_submitAggregateSigned_rejectsNonKeyperSignature() external {

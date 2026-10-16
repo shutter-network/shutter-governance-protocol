@@ -22,7 +22,7 @@ from shutter_governance_protocol.services.common.reads import read_all_ballots
 from shutter_governance_protocol.core.aggregation import build_aggregate_artifact
 from shutter_governance_protocol.core.authz import Signer
 from shutter_governance_protocol.crypto import proofs
-from shutter_governance_protocol.crypto.dkg import KeyperDKGState, derive_joint_mpk, derive_mpk_share
+from shutter_governance_protocol.crypto.dkg import KeyperDKGState, committee_keys, derive_joint_mpk
 from shutter_governance_protocol.crypto.points import g2_from_compressed, g2_to_compressed
 from shutter_governance_protocol.envelopes.types import DecryptionShareEntry, DecryptionShareEnvelope
 from shutter_governance_protocol.ports.data_layer import ElectionDataLayer
@@ -59,7 +59,7 @@ class KeyperService:
         """
         quorum = self.dkg.quorum
         pk = derive_joint_mpk(all_commitments, quorum)
-        committee = [derive_mpk_share(i, all_commitments, quorum) for i in sorted(all_commitments)]
+        committee = committee_keys(self.dkg.n, all_commitments, quorum)
         pk_b = g2_to_compressed(pk)
         committee_b = [g2_to_compressed(c) for c in committee]
         sig = write_auth.sign_dkg_result(self.signer.private_key, election_id, pk_b, committee_b)

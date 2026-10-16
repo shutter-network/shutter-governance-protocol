@@ -31,7 +31,7 @@ abstract contract ElectionVoting is ElectionBase {
         VotingTypes.BallotRecord storage record = ballotRecords[ballotIndex];
         record.ballot.pseudonym = ballot.pseudonym;
         record.ballot.vk = ballot.vk;
-        record.ballot.zkProof = ballot.zkProof;
+        record.ballot.zkProofHash = keccak256(ballot.zkProof); // the proof itself is in the event
         record.ballot.voterSignature = ballot.voterSignature;
         record.ballot.wrAttestation = ballot.wrAttestation;
         record.submittedAt = uint64(block.timestamp);
@@ -43,7 +43,7 @@ abstract contract ElectionVoting is ElectionBase {
 
         ballotIndexPlusOneByPseudonym[ballot.pseudonym] = ballotIndex + 1;
 
-        emit VoteSubmitted(ballot.pseudonym, ballotIndex);
+        emit VoteSubmitted(ballot.pseudonym, ballotIndex, ballot.zkProof);
     }
 
     function getNumBallots() external view returns (uint256) {

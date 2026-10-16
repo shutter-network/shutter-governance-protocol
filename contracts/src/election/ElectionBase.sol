@@ -23,6 +23,9 @@ abstract contract ElectionBase is AccessControl, IElection {
     error InvalidAggregatePayload();
     error InvalidDecryptionSharePayload();
     error DKGNotFinalized();
+    /// @notice A DKG vote after voting opened. Without this a late vote could finalize the
+    ///         key after the election had already failed for lack of one.
+    error DKGClosed(uint256 timestamp);
     error EtherTransferFailed();
     error DirectETHUnsupported();
     error VotingClosed(uint256 timestamp);
@@ -57,7 +60,7 @@ abstract contract ElectionBase is AccessControl, IElection {
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     bool public immutable weighted;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    uint32 public immutable scale;
+    uint256 public immutable scale;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint8 public immutable duplicatePolicy;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -66,6 +69,11 @@ abstract contract ElectionBase is AccessControl, IElection {
     address public immutable resultPublisherAddr;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     address public immutable voteProxyAddr;
+    /// @notice The block this election was created in. Proofs and the aggregate live in
+    ///         event logs; log queries start here rather than at genesis, which public RPC
+    ///         providers refuse.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    uint256 public immutable deployBlock;
 
     string internal protocolVersion;
 
@@ -76,9 +84,10 @@ abstract contract ElectionBase is AccessControl, IElection {
     bytes[] internal committeePublicKeys;
     VotingTypes.BallotRecord[] internal ballotRecords;
     mapping(bytes32 => uint256) internal ballotIndexPlusOneByPseudonym;
-    // Canonical aggregate stored as its ABI-encoded blob (set once at the t+1 quorum);
-    // decoded on read. Cheaper bytecode than structured storage — matters for EIP-170.
-    bytes internal encryptedTallyEncoded;
+    // Digest of the canonical aggregate, set once at the quorum. The artifact itself is in
+    // the AggregatePublished event: storing it cost ~22.5k gas per admitted ballot, so the
+    // quorum vote no longer fit in a block beyond ~1,300 voters.
+    bytes32 public aggregateDigest;
     bool internal aggregatePublished;
     VotingTypes.DecryptionShare[] internal decryptionShares;
     bool internal resultFinalized;
@@ -102,6 +111,9 @@ abstract contract ElectionBase is AccessControl, IElection {
             admin == address(0) || address(keyperSet_) == address(0) || params.resultPublisher == address(0)
                 || params.voteProxy == address(0) || params.votingEnd <= params.votingStart || params.numCandidates == 0
                 || params.budget == 0 || params.scale == 0
+                // Enum-like fields (see VotingTypes): an unknown value would make the
+                // election unreadable to every client.
+                || params.mode > 1 || params.variant > 1 || params.duplicatePolicy > 1
         ) {
             revert InvalidConfig();
         }
@@ -127,6 +139,7 @@ abstract contract ElectionBase is AccessControl, IElection {
         voteProxyAddr = params.voteProxy;
         protocolVersion = params.protocolVersion;
         wrPublicKey = params.pkWR;
+        deployBlock = block.number;
     }
 
     // forge-lint: disable-next-line(mixed-case-function)

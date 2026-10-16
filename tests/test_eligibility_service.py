@@ -204,3 +204,92 @@ def test_challenge_message_fixture():
         encode_defunct(text=challenge_message(eid, vk)), signature=sig)
     assert recovered == "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 
+
+
+# --------------------------------------------------------------------------- #
+#  One per voter: an unweighted election is issued weight 1
+# --------------------------------------------------------------------------- #
+
+def _weighted_client(tmp_path, weighted_for, weight_in_allowlist=79):
+    acct = Account.create()
+    p = tmp_path / "allow.json"
+    p.write_text(json.dumps({acct.address: weight_in_allowlist}))
+    app = build_eligibility_app(StubEligibilityService(ELIG_SK), pseudonym_secret=SECRET,
+                                allowlist_path=str(p), weighted_for=weighted_for)
+    return app.test_client(), acct
+
+
+def test_unweighted_election_is_issued_weight_1(tmp_path):
+    """The allowlist says 79, but the election is one per voter: the credential says 1, so
+    the voter's ballot is counted rather than excluded at tally."""
+    c, acct = _weighted_client(tmp_path, lambda _eid: False)
+    r = _post(c, acct, EID, _vk())
+    assert r.status_code == 200, r.get_json()
+    assert codecs.dec_attestation(r.get_json()["attestation"]).weight == 1
+
+
+def test_weighted_election_is_issued_the_weight_as_held(tmp_path):
+    c, acct = _weighted_client(tmp_path, lambda _eid: True)
+    r = _post(c, acct, EID, _vk())
+    assert r.status_code == 200, r.get_json()
+    assert codecs.dec_attestation(r.get_json()["attestation"]).weight == 79
+
+
+def test_unknown_election_is_404(tmp_path):
+    def lookup(_eid):
+        raise KeyError("unknown election")
+    c, acct = _weighted_client(tmp_path, lookup)
+    assert _post(c, acct, EID, _vk()).status_code == 404
+
+
+def test_unreadable_election_config_fails_closed(tmp_path):
+    """No credential is issued when the setting cannot be read: a guessed weight could be
+    one the tally rejects."""
+    def lookup(_eid):
+        raise ConnectionError("api down")
+    c, acct = _weighted_client(tmp_path, lookup)
+    r = _post(c, acct, EID, _vk())
+    assert r.status_code == 503
+    assert "attestation" not in r.get_json()
+
+
+def test_config_weighted_lookup_reads_the_registered_config():
+    """The real lookup reads the API's port surface, caches per election, and raises
+    KeyError for an unknown election."""
+    import threading
+
+    from flask import Flask
+    from werkzeug.serving import make_server
+
+    from conftest import ManualClock
+    from shutter_governance_protocol.adapters.memory import InMemoryDataLayer
+    from shutter_governance_protocol.core.authz import Signer
+    from shutter_governance_protocol.core.config import (DuplicatePolicy, ElectionConfig, KeyperIdentity, Mode,
+                                                         Threshold, Variant)
+    from shutter_governance_protocol.services.data_layer.data_layer import PORT_READ_PREFIX, port_read_blueprint
+    from shutter_governance_protocol.services.eligibility.eligibility import config_weighted_lookup
+
+    dl = InMemoryDataLayer(clock=ManualClock(0))
+    admin = Signer.generate()
+    cfg = ElectionConfig(
+        election_id=EID, num_candidates=3, budget=3, mode=Mode.EXACT, variant=Variant.A, weighted=False,
+        duplicate_policy=DuplicatePolicy.LAST_WINS, voting_start=1000, voting_end=2000, threshold=Threshold(2, 3),
+        keypers=tuple(KeyperIdentity(Signer.generate().identity, "") for _ in range(3)),
+        eligibility_key=StubEligibilityService(ELIG_SK).eligibility_key, result_publisher_key=b"\x09" * 20,
+        gateway_keys=(), admin_key=admin.identity, protocol_version="v1")
+    dl.register_election(cfg, admin.sign_register(cfg))
+    api = Flask("api")
+    api.register_blueprint(port_read_blueprint(dl), url_prefix=PORT_READ_PREFIX)
+    srv = make_server("127.0.0.1", 0, api, threaded=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    lookup = config_weighted_lookup(f"http://127.0.0.1:{srv.server_port}")
+    try:
+        assert lookup(EID) is False
+        try:
+            lookup((2).to_bytes(32, "big"))
+            raise AssertionError("expected KeyError for an unknown election")
+        except KeyError:
+            pass
+    finally:
+        srv.shutdown()
+    assert lookup(EID) is False  # served from the cache once the API is gone

@@ -81,6 +81,11 @@ class AutoDKG:
         # resurrects a stall. Only the admin's clearTallyStalled (retry) resumes it.
         self._attempts: dict[str, dict] = {}
         self._tally_attempts: dict[str, dict] = {}  # eid_hex → {"agg": n, "dec": n} (per-run counter)
+        # Elections whose stalled flag this coordinator wrote (and has not yet seen cleared),
+        # and elections it abandoned but could not mark. Reaching `_drive_tally` with an
+        # exhausted counter means "the admin cleared it" only for the first set.
+        self._stall_marked: set[str] = set()
+        self._stall_owed: set[str] = set()
         self._tokens_by_committee: dict[tuple, dict] = {}
         self._tally_phase: dict[str, str] = {}  # eid_hex → last-logged tally phase (dedupes per-poll spam)
 
@@ -95,14 +100,15 @@ class AutoDKG:
         the data-layer config, so it is identical on the db and chain backends."""
         return {i: bytes(k.signing_key) for i, k in enumerate(config.keypers, start=1)}
 
-    def _bootstrap(self, urls: dict[int, str], member_addrs: dict[int, bytes]) -> dict[int, str]:
+    def _bootstrap(self, urls: dict[int, str], member_addrs: dict[int, bytes],
+                   require: set[int] | None = None) -> dict[int, str]:
         """Full ``/auth/bootstrap`` of the committee: reuse-or-mint each keyper's stable
         credential and install it + this committee's peer map on every member. Used to
         drive the DKG (the ceremony needs the correct peer map). Returns
-        ``{index → api_token}`` and caches it."""
+        ``{index → api_token}`` and caches it. ``require`` as in ``bootstrap_keypers``."""
         api_tokens, _peer = coord.bootstrap_keypers(
             self.coordinator, urls, member_addrs=member_addrs,
-            relay_token=self.relay_token, token_store=self.token_store)
+            relay_token=self.relay_token, token_store=self.token_store, require=require)
         self._tokens_by_committee[tuple(sorted(urls.items()))] = api_tokens
         self.log.info("op=bootstrap status=ok committee=%d", len(urls))
         return api_tokens
@@ -111,7 +117,9 @@ class AutoDKG:
         """Return ``{index → api_token}`` for this committee — the cheap path used by the
         tally (no peer map needed). Served from the in-memory cache, else reassembled
         from the per-keyper store; only if a member has no stable credential yet (or
-        there is no store) does it fall back to a full :meth:`_bootstrap`."""
+        there is no store) does it fall back to a full :meth:`_bootstrap`. That one
+        requires no keyper in particular: the tally needs only a quorum, so a keyper that
+        is down is skipped, and gets its token by the 401 path once it is back."""
         key = tuple(sorted(urls.items()))
         if key in self._tokens_by_committee:
             return self._tokens_by_committee[key]
@@ -125,16 +133,18 @@ class AutoDKG:
             else:  # every member had a persisted credential — reuse without re-installing
                 self._tokens_by_committee[key] = assembled
                 return assembled
-        return self._bootstrap(urls, member_addrs)
+        return self._bootstrap(urls, member_addrs, require=set())
 
-    def _rebootstrap_one(self, urls: dict[int, str], member_addrs: dict[int, bytes], i: int) -> str | None:
+    def _rebootstrap_one(self, urls: dict[int, str], member_addrs: dict[int, bytes], i: int,
+                         *, tally: bool = False) -> str | None:
         """401 safety net: re-install keyper ``i``'s stable credential (+ this committee's
         peer map) and return its api_token. Per-keyper credentials mean this never
-        disturbs the other members, so it can't ping-pong between concurrent elections."""
+        disturbs the other members, so it can't ping-pong between concurrent elections.
+        In the tally only keyper ``i`` has to answer; the DKG still needs every member."""
         try:
             api_tokens, _peer = coord.bootstrap_keypers(
                 self.coordinator, urls, member_addrs=member_addrs, relay_token=self.relay_token,
-                token_store=self.token_store, install={i})
+                token_store=self.token_store, install={i}, require={i} if tally else None)
             self._tokens_by_committee[tuple(sorted(urls.items()))] = api_tokens
             self.log.info("op=rebootstrap status=ok keyper=%d committee=%d", i, len(urls))
             return api_tokens[i]
@@ -168,6 +178,10 @@ class AutoDKG:
             # The persisted flag is authoritative: the coordinator does NOT drive a stalled
             # tally (a restart never resurrects it). Only the admin's clearTallyStalled
             # (retry) flips it back to Tallying, and the next poll resumes with a fresh budget.
+            # A mark that landed although its write reported an error is now confirmed.
+            if eid_hex in self._stall_owed:
+                self._stall_owed.discard(eid_hex)
+                self._stall_marked.add(eid_hex)
             return "tally_stalled"
         return "not_ready"  # KeyReady / Voting / Cancelled
 
@@ -179,10 +193,10 @@ class AutoDKG:
             self._tally_phase[eid_hex] = phase
             self.log.info("op=tally status=%s election=%s", phase, eid_hex)
 
-    def _mark_tally_stalled(self, election_id: bytes) -> None:
-        """Persist the stalled flag (result-publisher auth). The coordinator only ever
-        *marks* — clearing is the admin's retry. Best-effort: a write failure must never
-        break the tally loop (the mark is retried next poll)."""
+    def _mark_tally_stalled(self, election_id: bytes) -> bool:
+        """Persist the stalled flag (result-publisher auth); return whether it landed. The
+        coordinator only ever *marks* — clearing is the admin's retry. A write failure must
+        never break the tally loop: the caller retries just the mark on the next poll."""
         # The signature carries when it was made. Without it the digest binds only the
         # op and the election, so one mark stays valid forever and an observer could
         # replay it after each admin retry until the tally never completed. Re-signed
@@ -201,6 +215,9 @@ class AutoDKG:
             )
         except Exception as err:  # noqa: BLE001
             self.log.warning("op=tally status=mark_stalled_error election=%s err=%s", election_id.hex(), err)
+            return False
+        self._stall_marked.add(election_id.hex())
+        return True
 
     def _past_tally_deadline(self, rec) -> bool:
         """Has the tally had long enough? Measured from ``voting_end``.
@@ -274,22 +291,45 @@ class AutoDKG:
         except Exception as err:  # noqa: BLE001
             self.log.error("op=tally status=bootstrap_error election=%s err=%s", eid_hex, err)
             return "error"
-        rebootstrap = lambda i: self._rebootstrap_one(urls, member_addrs, i)  # noqa: E731 — 401 safety net
+        rebootstrap = lambda i: self._rebootstrap_one(urls, member_addrs, i, tally=True)  # noqa: E731 — 401 safety net
         att = self._tally_attempts.setdefault(eid_hex, {"agg": 0, "dec": 0})
-        # Fresh budget on resume: `_drive_tally` is only reached when the flag is clear
-        # (state Tallying). An exhausted counter here therefore means the admin cleared a
-        # prior stall (the retry) — reset and try again from zero.
-        if att["agg"] >= self.max_tally_attempts or att["dec"] >= self.max_tally_attempts:
-            self.log.info("op=tally status=retrying election=%s (admin cleared the stall — fresh budget)", eid_hex)
-            att = self._tally_attempts[eid_hex] = {"agg": 0, "dec": 0}
+        # `_drive_tally` is only reached when the flag is clear (state Tallying), so an
+        # exhausted counter means one of two things. If this coordinator wrote the flag,
+        # the admin has since cleared it (the retry): fresh budget. If the write failed,
+        # the abandon is still owed: retry only the mark, not the keypers. Treating a
+        # failed mark as a retry restarted the tally every 5 attempts, forever, with a
+        # log saying the admin had cleared it and the admin never shown TallyStalled.
+        if eid_hex in self._stall_owed or (
+            eid_hex not in self._stall_marked
+            and (att["agg"] >= self.max_tally_attempts or att["dec"] >= self.max_tally_attempts)
+        ):
+            if self._mark_tally_stalled(election_id):
+                self._stall_owed.discard(eid_hex)
+                self.log.error("op=tally status=abandoned election=%s — stalled (mark retried); "
+                               "admin 'retry' (clearTallyStalled) required to resume", eid_hex)
+            else:
+                self._stall_owed.add(eid_hex)
+                self.log.error("op=tally status=mark_stalled_pending election=%s — the tally is "
+                               "abandoned but the stalled flag could not be written", eid_hex)
+            return "tally_abandoned"
+        if eid_hex in self._stall_marked:  # we wrote the flag and it is clear now: the retry
+            self._stall_marked.discard(eid_hex)
+            if att["agg"] >= self.max_tally_attempts or att["dec"] >= self.max_tally_attempts:
+                self.log.info("op=tally status=retrying election=%s (admin cleared the stall — fresh budget)", eid_hex)
+                att = self._tally_attempts[eid_hex] = {"agg": 0, "dec": 0}
 
         def _abandon(phase: str, n: int, reason: str) -> str:
             # Mark the persisted flag (result-publisher auth). The coordinator skips the
             # election hereafter (state → TallyStalled); only the admin's retry clears it.
-            self._mark_tally_stalled(election_id)
-            self.log.error("op=tally status=abandoned phase=%s reason=%s election=%s attempts=%d — "
-                           "stalled; admin 'retry' (clearTallyStalled) required to resume",
-                           phase, reason, eid_hex, n)
+            if self._mark_tally_stalled(election_id):
+                self.log.error("op=tally status=abandoned phase=%s reason=%s election=%s attempts=%d — "
+                               "stalled; admin 'retry' (clearTallyStalled) required to resume",
+                               phase, reason, eid_hex, n)
+            else:
+                self._stall_owed.add(eid_hex)
+                self.log.error("op=tally status=mark_stalled_pending phase=%s reason=%s election=%s "
+                               "attempts=%d — abandoned, but the stalled flag could not be written; "
+                               "retrying the mark next poll", phase, reason, eid_hex, n)
             return "tally_abandoned"
 
         # 1. Aggregate phase — trigger + gate on the canonical (t+1) quorum aggregate.

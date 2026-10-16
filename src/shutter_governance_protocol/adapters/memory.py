@@ -16,6 +16,8 @@ conformance suite.
 
 from __future__ import annotations
 
+import functools
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
@@ -54,8 +56,24 @@ class _Stored:
     tally_stalled: bool = False  # advisory (coordinator abandoned the tally); recoverable
 
 
+def _locked(method):
+    """Serialize a port method on the adapter's lock.
+
+    The adapter is called from several threads at once: keyper HTTP servers, and the
+    threaded data-layer service when it fronts this backend. Without the lock a read
+    could iterate a dict while a keyper wrote to it ("dictionary changed size during
+    iteration"), and a check-then-write such as the aggregate quorum check could
+    interleave. The database backend gets the same serialization from row locks."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class InMemoryDataLayer(ElectionDataLayer):
     def __init__(self, clock: Callable[[], int] | None = None):
+        self._lock = threading.RLock()
         self._elections: dict[bytes, _Stored] = {}
         self._next_id = 0  # registry-style sequential election ids (1, 2, …)
         self._clock = clock or (lambda: 0)
@@ -70,19 +88,9 @@ class InMemoryDataLayer(ElectionDataLayer):
             raise KeyError(f"unknown election {election_id.hex()}")
         return st
 
-    def _keyper_index_by_recovery(self, config: ElectionConfig, digest: bytes, sig: bytes) -> int:
-        """Recover the keyper from a content signature; return its 1-based index."""
-        try:
-            recovered = write_auth.recover_digest(digest, sig)
-        except Exception as exc:  # noqa: BLE001
-            raise WriteAuthorizationError("bad keyper signature") from exc
-        for i, k in enumerate(config.keypers, start=1):
-            if k.signing_key == recovered:
-                return i
-        raise WriteAuthorizationError("signature matches no registered keyper")
-
     # -- election lifecycle ------------------------------------------------- #
 
+    @_locked
     def register_election(self, config: ElectionConfig, admin_sig: bytes) -> bytes:
         if not authz.verify_register(config.admin_key, admin_sig, config):
             raise WriteAuthorizationError("register: bad admin signature")
@@ -101,6 +109,7 @@ class InMemoryDataLayer(ElectionDataLayer):
         self._elections[election_id] = _Stored(config=stored)
         return election_id
 
+    @_locked
     def cancel_election(self, election_id: bytes, admin_sig: bytes) -> None:
         st = self._get(election_id)
         if self._clock() >= st.config.voting_start:
@@ -109,6 +118,7 @@ class InMemoryDataLayer(ElectionDataLayer):
             raise WriteAuthorizationError("cancel: bad admin signature")
         st.cancelled = True
 
+    @_locked
     def get_election(self, election_id: bytes) -> ElectionRecord:
         st = self._get(election_id)
         return ElectionRecord(
@@ -116,6 +126,7 @@ class InMemoryDataLayer(ElectionDataLayer):
             finalized_key=self.get_finalized_key(election_id)
         )
 
+    @_locked
     def list_elections(self, filter: ElectionFilter | None = None) -> list[bytes]:
         out = []
         for eid, st in self._elections.items():
@@ -126,11 +137,12 @@ class InMemoryDataLayer(ElectionDataLayer):
 
     # -- DKG ---------------------------------------------------------------- #
 
+    @_locked
     def submit_dkg_result(self, election_id, pk_election, committee_pks, keyper_sig) -> None:
         st = self._get(election_id)
         committee = [bytes(p) for p in committee_pks]
         digest = write_auth.dkg_result_digest(election_id, bytes(pk_election), committee)
-        idx = self._keyper_index_by_recovery(st.config, digest, keyper_sig)
+        idx = authz.keyper_index_by_recovery(st.config, digest, keyper_sig)
         submission = DKGResultSubmission(
             election_id=election_id,
             pk_election=bytes(pk_election),
@@ -147,12 +159,18 @@ class InMemoryDataLayer(ElectionDataLayer):
             ):
                 raise ImmutabilityError(f"keyper {idx} already submitted a different DKG result")
             return
+        # A new vote once voting has opened could finalize the key of an election that has
+        # already failed for lack of one (the chain contract refuses it too).
+        if self._clock() >= st.config.voting_start:
+            raise VotingWindowError("DKG vote submitted after voting_start")
         st.dkg_by_keyper[idx] = submission
 
+    @_locked
     def get_dkg_submissions(self, election_id) -> list[DKGResultSubmission]:
         st = self._get(election_id)
         return [st.dkg_by_keyper[i] for i in sorted(st.dkg_by_keyper)]
 
+    @_locked
     def get_finalized_key(self, election_id) -> FinalizedKey | None:
         return self._finalized_key_of(self._get(election_id))
 
@@ -170,6 +188,7 @@ class InMemoryDataLayer(ElectionDataLayer):
 
     # -- ballots ------------------------------------------------------------ #
 
+    @_locked
     def submit_ballot(self, election_id, ballot: BallotEnvelope, gateway_sig: bytes = b"") -> int:
         st = self._get(election_id)
         # Ballots are self-verifying and proof verification stays authoritative at tally
@@ -217,15 +236,18 @@ class InMemoryDataLayer(ElectionDataLayer):
         if derive_state(st.config, facts, now) is not ElectionState.VOTING:
             raise VotingWindowError("ballot submitted outside the open voting window")
 
+    @_locked
     def list_ballots(self, election_id, start: int, count: int) -> list[StoredBallot]:
         st = self._get(election_id)
         return st.ballots[start : start + count]
 
+    @_locked
     def count_ballots(self, election_id) -> int:
         return len(self._get(election_id).ballots)
 
     # -- tally artifacts ---------------------------------------------------- #
 
+    @_locked
     def submit_aggregate(self, election_id, aggregate: AggregateArtifact, keyper_sig) -> None:
         st = self._get(election_id)
         # Ordering guard (matches the chain contract's VotingStillOpen revert): the
@@ -234,7 +256,7 @@ class InMemoryDataLayer(ElectionDataLayer):
         if self._clock() < st.config.voting_end:
             raise VotingWindowError("aggregate submitted before voting_end")
         digest = write_auth.aggregate_digest_of(election_id, aggregate)
-        idx = self._keyper_index_by_recovery(st.config, digest, keyper_sig)
+        idx = authz.keyper_index_by_recovery(st.config, digest, keyper_sig)
         existing = st.aggregate_by_keyper.get(idx)
         if existing is not None and existing == aggregate:
             return  # idempotent resend of this keyper's current submission
@@ -258,6 +280,7 @@ class InMemoryDataLayer(ElectionDataLayer):
     def _aggregate_finalized(self, st) -> bool:
         return self.get_aggregate(st.config.election_id) is not None
 
+    @_locked
     def get_aggregate(self, election_id) -> AggregateArtifact | None:
         st = self._get(election_id)
         return resolve_unique(
@@ -265,6 +288,7 @@ class InMemoryDataLayer(ElectionDataLayer):
             st.config.threshold.quorum, artifact="aggregate", election_id=election_id,
         )
 
+    @_locked
     def submit_decryption_share(self, election_id, share: DecryptionShareEnvelope, keyper_sig) -> None:
         st = self._get(election_id)
         # Ordering guards (mirroring the chain contract's ElectionDecryption reverts):
@@ -278,7 +302,7 @@ class InMemoryDataLayer(ElectionDataLayer):
         shares = [e.sigma for e in share.entries]
         proofs = [(int.from_bytes(e.proof[:32], "big"), int.from_bytes(e.proof[32:], "big")) for e in share.entries]
         digest = write_auth.decryption_share_digest(election_id, shares, proofs)
-        idx = self._keyper_index_by_recovery(st.config, digest, keyper_sig)
+        idx = authz.keyper_index_by_recovery(st.config, digest, keyper_sig)
         if idx != share.keyper_index:
             raise WriteAuthorizationError(
                 f"share keyper_index {share.keyper_index} does not match signer {idx}"
@@ -292,10 +316,12 @@ class InMemoryDataLayer(ElectionDataLayer):
             return
         st.shares_by_keyper[idx] = share
 
+    @_locked
     def list_decryption_shares(self, election_id) -> list[DecryptionShareEnvelope]:
         st = self._get(election_id)
         return [st.shares_by_keyper[i] for i in sorted(st.shares_by_keyper)]
 
+    @_locked
     def publish_result(self, election_id, result: ResultArtifact, result_publisher_sig) -> None:
         st = self._get(election_id)
         if not authz.verify_request(
@@ -309,9 +335,11 @@ class InMemoryDataLayer(ElectionDataLayer):
             return
         st.result = result
 
+    @_locked
     def get_result(self, election_id) -> ResultArtifact | None:
         return self._get(election_id).result
 
+    @_locked
     def set_tally_stalled(self, election_id, stalled: bool, sig, issued_at: int) -> None:
         st = self._get(election_id)
         op = "tally_stall" if stalled else "tally_resume"
@@ -344,5 +372,6 @@ class InMemoryDataLayer(ElectionDataLayer):
 
     # -- capability --------------------------------------------------------- #
 
+    @_locked
     def verifiability_tier(self) -> int:
         return 0

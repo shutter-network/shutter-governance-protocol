@@ -47,6 +47,7 @@ def _verify(mpk, b, num_candidates, budget, att):
         attestation=att,
         num_candidates=num_candidates,
         budget=budget,
+        mode="exact",
     )
 
 
@@ -101,8 +102,8 @@ def test_wrong_mpk_fails():
 
 def test_bvp_codec_round_trip():
     mpk, b, att = _build([1, 0, 2], budget=3)
-    rp, e, z = ballot.decode_ballot_validity_proof(b.zk_proof, 3, 3)
-    reencoded = ballot.encode_ballot_validity_proof(rp, e, z)
+    rp, budget_proof = ballot.decode_ballot_validity_proof(b.zk_proof, 3, 3)
+    reencoded = ballot.encode_ballot_validity_proof(rp, budget_proof)
     assert reencoded == b.zk_proof
 
 
@@ -178,8 +179,8 @@ def test_bvp_rejects_non_canonical_budget_scalar():
 def test_bvp_honest_proof_still_decodes_and_verifies():
     """Guard against the canonicality check being too strict."""
     mpk, b, att = _build([2, 1, 0], budget=3)
-    rp, e, z = ballot.decode_ballot_validity_proof(b.zk_proof, 3, 3)
-    assert ballot.encode_ballot_validity_proof(rp, e, z) == b.zk_proof
+    rp, budget_proof = ballot.decode_ballot_validity_proof(b.zk_proof, 3, 3)
+    assert ballot.encode_ballot_validity_proof(rp, budget_proof) == b.zk_proof
     ok, reason = _verify(mpk, b, 3, 3, att)
     assert ok, reason
 

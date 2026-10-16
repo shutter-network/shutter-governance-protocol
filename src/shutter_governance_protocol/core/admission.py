@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from shutter_governance_protocol.core.config import DuplicatePolicy, ElectionConfig
+from shutter_governance_protocol.core.config import DuplicatePolicy, ElectionConfig, Variant
 from shutter_governance_protocol.crypto.ballot import verify_ballot_crypto
 from shutter_governance_protocol.crypto.points import g2_from_compressed
 from shutter_governance_protocol.envelopes.types import BallotEnvelope, Exclusion, ExclusionReason, StoredBallot
@@ -57,10 +57,14 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
     :class:`ExclusionReason`. ``mpk`` is a decoded G2 point.
     """
     env = sb.envelope
+    # Stored, but not decodable into a ballot (see StoredBallot).
+    if env is None:
+        return ExclusionReason.MALFORMED
     att = env.attestation
 
-    # Wrong-election binding / structural mismatch.
-    if env.election_id != config.election_id:
+    # Wrong-election binding / structural mismatch. Ballot crypto implements Variant A
+    # only, so a Variant B election (refused at registration) admits nothing.
+    if env.election_id != config.election_id or config.variant != Variant.A:
         return ExclusionReason.MALFORMED
 
     # Out-of-window (only when the adapter supplies an authoritative time).
@@ -73,6 +77,11 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
     if not verify_attestation(
         config.eligibility_key, att, election_id=config.election_id
     ):
+        return ExclusionReason.INVALID_ATTESTATION
+    # One per voter: an unweighted election counts every ballot once, whatever weight the
+    # issuer signed. Excluded rather than counted at 1, so a misconfigured issuer shows up
+    # in the exclusions instead of being silently corrected.
+    if not config.weighted and att.weight != 1:
         return ExclusionReason.INVALID_ATTESTATION
 
     # Ballot crypto: range/budget proofs + Schnorr signature.
@@ -87,6 +96,7 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
         attestation=att,
         num_candidates=config.num_candidates,
         budget=config.budget,
+        mode=config.mode,
     )
     if not ok:
         # A pre-v2 client signed a message that excluded the credential. Surfaced as

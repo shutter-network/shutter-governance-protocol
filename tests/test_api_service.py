@@ -125,3 +125,20 @@ def test_strict_id_parsing(api):
 def test_capability(api):
     client, _, _ = api
     assert client.get("/capability").get_json()["verifiabilityTier"] == 0
+
+
+def test_ballot_list_keeps_a_malformed_record_in_its_slot(api):
+    """The dashboard addresses ballots by position within a page, so an undecodable
+    record must be served in its slot (as its reason) rather than dropped or a 500."""
+    from shutter_governance_protocol.envelopes.types import StoredBallot
+
+    client, env, dl = api
+    eid = _register(env, dl)
+    n = int.from_bytes(eid, "big")
+    dl.count_ballots = lambda _eid: 1
+    dl.list_ballots = lambda _eid, start, count: [
+        StoredBallot(0, None, submitted_at=1, malformed_reason="JSONDecodeError: bad")
+    ][start:start + count]
+    resp = client.get(f"/elections/{n}/ballots")
+    assert resp.status_code == 200
+    assert resp.get_json()["ballots"] == [{"malformed": "JSONDecodeError: bad"}]

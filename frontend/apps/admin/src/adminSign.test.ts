@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cancelDigest, canonicalize, lowercaseHex, registerDigest } from "./adminSign";
+import { cancelDigest, canonicalize, lowercaseHex, registerDigest, requestNoncePayload, retryTallyDigest } from "./adminSign";
 
 // Fixtures generated from Python (shutter_governance_protocol.core.authz). If the wire config shape or the
 // digest scheme changes, regenerate these from register_digest / request_digest.
@@ -33,6 +33,8 @@ const EXPECTED_CANON =
   '{"adminKey":"0xabababababababababababababababababababab","budget":3,"duplicatePolicy":"last-wins","electionId":"0x1111111111111111111111111111111111111111111111111111111111111111","eligibilityKey":"0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1","gatewayKeys":["0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],"keypers":[{"signingKey":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","url":"http://k1:8101"},{"signingKey":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","url":"http://k2:8102"},{"signingKey":"0xcccccccccccccccccccccccccccccccccccccccc","url":"http://k3:8103"}],"mode":"exact","numCandidates":3,"protocolVersion":"v1","resultPublisherKey":"0xdddddddddddddddddddddddddddddddddddddddd","scale":1,"selfSubmitFee":"0","threshold":{"n":3,"t":2},"variant":"A","votingEnd":2000,"votingStart":1000,"weighted":true}';
 const EXPECTED_REGISTER = "0x8536550a834b1758270a909fdf80fa18a10d08ea391abfb00132d62f586e52e7";
 const EXPECTED_CANCEL = "0xb6fcd4128e28fa3ad25b85b21ae2ffd9d586e9b0d67a419a3cdb7e4c85cd985f";
+// request_digest("tally_resume", eid 7, request_nonce_payload(1700000000)).
+const EXPECTED_RETRY = "0x23a3ce05b02fe845a2baf18b3eab4b4384ab530a6c1cedfc1e970d8dee191842";
 const EID_7 = ("0x" + (7).toString(16).padStart(64, "0")) as `0x${string}`;
 
 describe("admin digests match shutter_governance_protocol.core.authz (byte-exact)", () => {
@@ -49,6 +51,15 @@ describe("admin digests match shutter_governance_protocol.core.authz (byte-exact
   });
   it("cancelDigest == request_digest('cancel', eid)", () => {
     expect(cancelDigest(EID_7)).toBe(EXPECTED_CANCEL);
+  });
+  // The retry digest had no cross-check, so when the service started requiring a signed
+  // timestamp the browser kept signing the old empty payload and every Retry failed.
+  it("retryTallyDigest == request_digest('tally_resume', eid, request_nonce_payload(issuedAt))", () => {
+    expect(retryTallyDigest(EID_7, 1700000000)).toBe(EXPECTED_RETRY);
+    expect(retryTallyDigest(EID_7, 1700000001)).not.toBe(EXPECTED_RETRY);
+  });
+  it("requestNoncePayload is 8 bytes, big-endian seconds", () => {
+    expect(Array.from(requestNoncePayload(1700000000))).toEqual([0, 0, 0, 0, 0x65, 0x53, 0xf1, 0x00]);
   });
 });
 

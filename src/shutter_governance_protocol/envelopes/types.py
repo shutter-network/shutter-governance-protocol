@@ -6,8 +6,9 @@ encoding/decoding and byte-length validation live in
 :mod:`shutter_governance_protocol.envelopes.codecs`.
 
 Byte fields are held as raw ``bytes`` here and only become ``0x``-hex at the JSON
-boundary. Fixed byte sizes (from the SDK v1 codecs) are recorded
-in :data:`SIZES` and enforced by the codecs so malformed input is rejected.
+boundary. Fixed byte sizes (from the SDK v1 codecs) are defined
+in :mod:`shutter_governance_protocol.crypto.params` and enforced by the codecs so malformed
+input is rejected.
 """
 
 from __future__ import annotations
@@ -15,20 +16,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-# Fixed byte sizes of the crypto suite. Enforced on decode.
-G1_BYTES = 48  # compressed G1 (voter vk, Schnorr R, attestation/eligibility keys)
-G2_BYTES = 96  # compressed G2 (ElGamal ciphertext components, sigma, committee PKs)
-SCHNORR_BYTES = 80  # R (48) || s (32)
-DLEQ_BYTES = 64  # e (32) || z (32)
-BYTES32 = 32  # election_id, pseudonym
+# Fixed byte sizes of the crypto suite, enforced on decode. Defined once, in
+# crypto/params.py, and re-exported here for the codecs.
+from shutter_governance_protocol.crypto.params import DLEQ_BYTES, G1_BYTES, G2_BYTES, SCHNORR_BYTES  # noqa: E402,F401
 
-SIZES = {
-    "g1": G1_BYTES,
-    "g2": G2_BYTES,
-    "schnorr": SCHNORR_BYTES,
-    "dleq": DLEQ_BYTES,
-    "bytes32": BYTES32,
-}
+BYTES32 = 32  # election_id, pseudonym
 
 
 class ExclusionReason(str, Enum):
@@ -134,11 +126,19 @@ class StoredBallot:
     out-of-band (direct SQL, a second writer, a restored backup) and makes the
     window publicly auditable — it does **not** defeat an operator who backdates.
     Only the chain's block time is adversarially authoritative.
+
+    ``envelope`` is ``None`` when the stored bytes cannot be decoded into a ballot, and
+    ``malformed_reason`` says why. This happens on the chain, whose contract stores the
+    credential as opaque bytes, so anyone can append one that is not a credential. The
+    record keeps its place in the order and admission excludes it as ``MALFORMED``.
+    Raising instead would make every read of the list fail, halting the tally and the
+    ingest filter for the rest of the election.
     """
 
     sequence_number: int
-    envelope: BallotEnvelope
+    envelope: BallotEnvelope | None
     submitted_at: int | None = None
+    malformed_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +153,7 @@ class DKGResultSubmission:
     pk_election: bytes  # G2, 96 bytes — joint election public key
     committee_pks: tuple[bytes, ...]  # each G2, 96 bytes — per-keyper public shares
     keyper_signature: bytes  # signature by the submitting keyper's registered key
+    submitter: bytes | None = None
 
 
 @dataclass(frozen=True)

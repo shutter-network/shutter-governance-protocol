@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {Election} from "../src/Election.sol";
 import {ElectionBase} from "../src/election/ElectionBase.sol";
@@ -96,14 +96,31 @@ contract ElectionExtensionsTest is Test {
         agg.exclusions[0] = VotingTypes.Exclusion({sequenceNumber: 1, reason: 3}); // DUPLICATE_PSEUDONYM
         agg.totalAdmittedWeight = 5;
 
-        // Committee-owned aggregation: canonical only at the t+1 byte-identical quorum,
-        // and the full admitted set / exclusions / weight survive the quorum store.
+        // Committee-owned aggregation: canonical only at the t-of-n byte-identical quorum.
+        // Storage keeps the digest the keypers signed; the full artifact (admitted set,
+        // exclusions, weights) is published in the AggregatePublished event.
         vm.prank(keyper1);
         election.submitAggregate(agg);
+        assertEq(election.aggregateDigest(), bytes32(0)); // one vote is not a quorum
+        vm.recordLogs();
         vm.prank(keyper2);
         election.submitAggregate(agg);
 
-        VotingTypes.EncryptedTally memory stored = election.getAggregate();
+        bytes32 expectedDigest = keccak256(
+            abi.encodePacked("SHUTTER-GOVERNANCE-PROTOCOL-AGGREGATE-v1", election.electionId(), abi.encode(agg))
+        );
+        assertEq(election.aggregateDigest(), expectedDigest);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes memory tally;
+        bytes32 emittedDigest;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == IElection.AggregatePublished.selector) {
+                (emittedDigest, tally) = abi.decode(logs[i].data, (bytes32, bytes));
+            }
+        }
+        assertEq(emittedDigest, expectedDigest);
+        VotingTypes.EncryptedTally memory stored = abi.decode(tally, (VotingTypes.EncryptedTally));
         assertEq(stored.aggregates.length, 3);
         assertEq(stored.admitted.length, 2);
         assertEq(stored.admitted[1], 2);

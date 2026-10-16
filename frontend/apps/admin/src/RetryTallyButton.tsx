@@ -44,8 +44,10 @@ export function RetryTallyButton({ electionId, wallet }: { electionId: number; w
     setBusy(true);
     setStatus({ kind: "info", msg: "Awaiting wallet signature…" });
     try {
-      const signature = await wallet.signDigest(retryTallyDigest(eidToHex(electionId)));
-      await retryTally(eidToBareHex(electionId), signature);
+      // One timestamp for both: the signature covers it and the service checks it.
+      const issuedAt = Math.floor(Date.now() / 1000);
+      const signature = await wallet.signDigest(retryTallyDigest(eidToHex(electionId), issuedAt));
+      await retryTally(eidToBareHex(electionId), signature, issuedAt);
       setStatus({ kind: "ok", msg: `Retry requested for election #${electionId}` });
       load();
     } catch (e: unknown) {

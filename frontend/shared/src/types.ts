@@ -70,11 +70,14 @@ export interface AttestationJson {
   electionId: Hex;
   pseudonym: Hex;
   vk: Hex;
-  weight: number;
+  /** Decimal string: weights are often token balances in wei, far above 2^53, which a
+   *  JSON number cannot carry exactly. Parse with `BigInt`. (Older servers sent a
+   *  number; `BigInt` accepts both, but only the string is exact.) */
+  weight: string | number;
   /** Monotonic per (election, pseudonym): the re-vote arbiter. The issuer always
    * emits it; it was missing from this type while nothing here read it, and the
-   * binding message does. */
-  nonce?: number;
+   * binding message does. Decimal string, like `weight`. */
+  nonce?: string | number;
   signature: Hex;
 }
 
@@ -101,8 +104,8 @@ export interface AggregateJson {
   aggregates: CiphertextJson[];
   admitted: number[];
   exclusions: ExclusionJson[];
-  /** Sum of the admitted ballots' weights as held. */
-  totalAdmittedWeight: number;
+  /** Sum of the admitted ballots' weights as held. Decimal string (see `AttestationJson.weight`). */
+  totalAdmittedWeight: string | number;
   /**
    * The same sum after each weight was divided by the election's scale — what the
    * tally actually counted, and what the published totals reconcile against
@@ -112,7 +115,7 @@ export interface AggregateJson {
    * such an election was necessarily unscaled, so callers should fall back to
    * `totalAdmittedWeight` rather than to 0.
    */
-  totalScaledWeight?: number;
+  totalScaledWeight?: string | number;
 }
 
 export interface DecryptionShareJson {
@@ -123,7 +126,8 @@ export interface DecryptionShareJson {
 
 export interface ResultJson {
   electionId: number;
-  totals: number[];
+  /** Decimal strings: totals are votes × weights, so they grow with the weights. */
+  totals: (string | number)[];
   keyperIndices: number[];
-  bsgsBound: number;
+  bsgsBound: string | number;
 }

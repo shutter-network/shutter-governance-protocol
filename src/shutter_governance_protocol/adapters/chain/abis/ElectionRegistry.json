@@ -25,32 +25,6 @@
   },
   {
     "type": "function",
-    "name": "RESULT_PUBLISHER_ROLE",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "VOTE_PROXY_ROLE",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "electionCount",
     "inputs": [],
     "outputs": [
@@ -222,8 +196,8 @@
           },
           {
             "name": "scale",
-            "type": "uint32",
-            "internalType": "uint32"
+            "type": "uint256",
+            "internalType": "uint256"
           },
           {
             "name": "duplicatePolicy",

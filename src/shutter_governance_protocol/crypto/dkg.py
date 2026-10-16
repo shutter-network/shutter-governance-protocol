@@ -51,17 +51,33 @@ class KeyperDKGState:
             self.shares_for_others[i] = val
         return self.commitments, self.shares_for_others
 
-    def round2(self, all_commitments: dict, received_shares: dict):
+    def round2(self, all_commitments: dict, received_shares: dict, dealers=None):
         """Verify received shares (Feldman VSS) and combine into ``msk_j``.
+
+        ``dealers`` is the set of qualified dealers whose contributions make up the key
+        (default: every committee member). A dealer excluded for misbehaving is left out
+        of both the check and the sum, so its shares are ignored; the caller must build
+        the key from the same set (see :func:`qualified`).
 
         Raises ``ValueError`` with a ``bad_dealers`` attribute listing any dealer that
         published a commitment vector of the wrong length, delivered no usable
-        commitments at all, or whose share failed ``s_i·P2 == Σ_j my_id^j·γ_j`` — the
-        trigger for the signed complaint flow.
+        commitments at all, **delivered no share**, or whose share failed
+        ``s_i·P2 == Σ_j my_id^j·γ_j`` — the trigger for the signed complaint flow.
         """
         my_id = self.keyper_id
         expected_len = self.quorum
+        qualified_dealers = set(range(1, self.n + 1) if dealers is None else dealers)
+        received_shares = {d: s for d, s in received_shares.items() if d in qualified_dealers}
         bad_dealers = []
+        # Every committee member deals, and the joint key is built from every dealer's
+        # commitments. A dealer that publishes commitments but withholds this keyper's
+        # share would otherwise be skipped here: this keyper's secret would then lack a
+        # contribution that the published key includes, and its decryption shares would
+        # never verify. Treat a missing share like a bad one, so it is complained about
+        # and repaired before any key is published.
+        for dealer_id in sorted(qualified_dealers):
+            if dealer_id not in received_shares:
+                bad_dealers.append(dealer_id)
         for dealer_id, share in received_shares.items():
             comms = all_commitments.get(dealer_id)
             # A dealer must publish exactly `quorum` commitments (a degree-(quorum-1)
@@ -87,6 +103,7 @@ class KeyperDKGState:
             if not verify_share(comms, my_id, share):
                 bad_dealers.append(dealer_id)
         if bad_dealers:
+            bad_dealers = sorted(set(bad_dealers))
             err = ValueError(f"Keyper {my_id}: Feldman VSS failed for dealers {bad_dealers}")
             err.bad_dealers = bad_dealers
             raise err
@@ -125,6 +142,26 @@ def verify_share(commitments: list, recipient_index: int, share: int) -> bool:
         expected = add(expected, mul(c, x_power))
         x_power = (x_power * recipient_index) % CURVE_ORDER
     return eq(expected, mul(G2, share))
+
+
+def qualified(all_commitments: dict, excluded) -> dict:
+    """The commitments of the dealers that were not excluded.
+
+    The joint key and every committee key are sums over dealers, so building both from
+    this subset drops an excluded dealer's contribution entirely. The dealer stays a
+    committee *member*: it still holds a valid combined share from the other dealers'
+    shares, and its committee key is still derived (see :func:`committee_keys`).
+    """
+    return {d: c for d, c in all_commitments.items() if d not in set(excluded)}
+
+
+def committee_keys(n: int, all_commitments: dict, quorum: int) -> list:
+    """``committee_pks`` for members ``1..n``, from the given dealers' commitments.
+
+    Indexed by member, not by dealer: with a dealer excluded there are fewer dealers
+    than members, and every member still needs its entry at ``index - 1``.
+    """
+    return [derive_mpk_share(i, all_commitments, quorum) for i in range(1, n + 1)]
 
 
 def check_commitment_lengths(all_commitments: dict, quorum: int) -> None:

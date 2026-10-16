@@ -69,3 +69,36 @@ class TestUniformServiceOverMemory(DataLayerConformance):
         finally:
             srv.shutdown()
             thread.join()
+
+
+def test_malformed_ballot_round_trips_over_http():
+    """A record the backend could not decode is served as ``"ballot": null`` plus its
+    reason, in its own slot, and the client reads it back as ``envelope=None``. Keypers
+    read ballots this way, so the record must not break the read."""
+    from werkzeug.serving import make_server
+
+    from shutter_governance_protocol.envelopes.types import StoredBallot
+
+    clock = ManualClock(0)
+    dl = InMemoryDataLayer(clock=clock)
+    eid = (1).to_bytes(32, "big")
+    att = Attestation(election_id=eid, pseudonym=b"\x22" * 32, vk=b"\x33" * 48, weight=1, signature=b"\x44" * 80)
+    ballot = BallotEnvelope(
+        election_id=eid, pseudonym=b"\x22" * 32, vk=b"\x33" * 48,
+        ciphertexts=tuple(Ciphertext(c1=b"\x01" * 96, c2=b"\x02" * 96) for _ in range(3)),
+        zk_proof=b"\x01\x02\x03", voter_signature=b"\x55" * 80, attestation=att,
+    )
+    rows = [StoredBallot(0, ballot, submitted_at=5),
+            StoredBallot(1, None, submitted_at=6, malformed_reason="JSONDecodeError: bad")]
+    dl.list_ballots = lambda _eid, start, count: rows[start:start + count]
+    srv = make_server("127.0.0.1", 0, build_app(dl))
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        got = HttpDataLayerClient(f"http://127.0.0.1:{srv.server_port}").list_ballots(eid, 0, 2)
+    finally:
+        srv.shutdown()
+        thread.join()
+    assert got[0].envelope == ballot
+    assert (got[1].sequence_number, got[1].envelope, got[1].submitted_at) == (1, None, 6)
+    assert got[1].malformed_reason == "JSONDecodeError: bad"

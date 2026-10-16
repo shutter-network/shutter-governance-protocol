@@ -46,17 +46,13 @@ def deploy_library(w3: Web3, account, name: str) -> str:
 
 
 def send_tx(w3: Web3, account, built_fn):
-    """Sign+send a contract function/constructor call; return the receipt."""
+    """Sign+send a contract function/constructor call; return the receipt.
+
+    Raises if the transaction reverts, so a failed deploy is not reported as a success."""
+    from shutter_governance_protocol.adapters.chain.tx import send_and_confirm
+
     gas = built_fn.estimate_gas({"from": account.address})
-    tx = built_fn.build_transaction({
-        "from": account.address,
-        "nonce": w3.eth.get_transaction_count(account.address),
-        "gas": int(gas * 12 // 10),
-        "gasPrice": w3.eth.gas_price,
-    })
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    return w3.eth.wait_for_transaction_receipt(tx_hash)
+    return send_and_confirm(w3, account, built_fn, gas=gas * 12 // 10)
 
 
 def deploy_registry(w3: Web3, account) -> str:

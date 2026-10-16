@@ -177,3 +177,22 @@ class Signer:
 
     def sign_register(self, config) -> bytes:
         return sign_register(self.private_key, config)
+
+
+def keyper_index_by_recovery(config, digest: bytes, sig: bytes) -> int:
+    """Recover the keyper from a content signature; return its 1-based index.
+
+    Shared by the in-memory and database adapters, which authorize keyper writes the
+    same way.
+    """
+    from shutter_governance_protocol.core import write_auth
+    from shutter_governance_protocol.ports.data_layer import WriteAuthorizationError
+
+    try:
+        recovered = write_auth.recover_digest(digest, sig)
+    except Exception as exc:  # noqa: BLE001
+        raise WriteAuthorizationError("bad keyper signature") from exc
+    for i, k in enumerate(config.keypers, start=1):
+        if k.signing_key == recovered:
+            return i
+    raise WriteAuthorizationError("signature matches no registered keyper")

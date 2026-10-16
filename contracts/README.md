@@ -144,6 +144,8 @@ Implemented behavior:
 - `voteDKGResultSigned(bytes pkElection, bytes[] committeePKs, bytes keyperSig)` — **meta-tx**: the keyper content-signs (EIP-191), any relayer sends the tx paying gas, and the contract `ECDSA.recover`s the keyper as the on-chain author (so keypers need no gas)
 - keyper-only participation (member of the `KeyperSet`, whether via `msg.sender` or the recovered signer)
 - one DKG vote per keyper
+- votes are refused once `votingStart` is reached (`DKGClosed`): an election with no key by
+  then has failed, and a late quorum must not revive it
 - votes are counted by `keccak256(abi.encode(pkElection, committeePKs))`
 - different DKG results can receive votes independently
 - finalization once one DKG result reaches the keyper threshold
@@ -184,7 +186,8 @@ Implemented behavior:
   - timestamp
   - submitting address
   - ciphertexts
-  - ballot proof bytes
+  - `keccak256` of the ballot proof (`zkProofHash`); the proof itself is emitted in
+    `VoteSubmitted(pseudonym, ballotIndex, zkProof)` and readers check it against the hash
   - voter signature
   - WR attestation
 
@@ -243,12 +246,16 @@ Implemented behavior:
 - `submitAggregateSigned(EncryptedTally, bytes keyperSig)` — a relayer submits a keyper-signed aggregate
 - each keyper can replace its submission until a quorum finalises
 - `t` identical submissions finalise the aggregate; later direct contract submissions revert
-- storage of candidate ciphertexts, admitted ballot indices, exclusion indices and reasons,
-  total admitted weight and total scaled weight
+- at the quorum, storage of the aggregate's digest only (`aggregateDigest`); the artifact
+  itself (candidate ciphertexts, admitted ballot indices, exclusion indices and reasons, total
+  admitted weight and total scaled weight) is emitted in
+  `AggregatePublished(electionId, digest, abi.encode(tally))`. Storing it cost ~22.5k gas
+  per admitted ballot, which ran out of block gas past ~1,300 ballots
 
 Read helpers:
 
-- `getAggregate`
+- `aggregateDigest` (zero until published); readers take the event whose `tally` hashes to it
+- `deployBlock` — where log queries for this election should start
 
 Validation:
 
@@ -412,9 +419,10 @@ Required environment variables (suitable for a `.env` file):
 
 Optional variables and defaults: `SELF_SUBMIT_FEE=0`, `MODE=0` (exact),
 `VARIANT=0` (A), `WEIGHTED=false`, `SCALE=1`, `DUPLICATE_POLICY=1` (last-wins),
-and `PROTOCOL_VERSION=SHUTTER-VOTE-v1`. The current Python ballot implementation
-supports A/exact; the contract stores the other settings without implementing
-their cryptographic verification.
+and `PROTOCOL_VERSION=SHUTTER-VOTE-v1`. The contract stores these settings and does not
+verify ballot proofs. The Python implementation supports variant A in both modes (`MODE=0`
+exact, `MODE=1` atMost). Variant B (`VARIANT=1`) is not implemented: the admin service
+refuses it at registration.
 
 Example `.env` (replace the timestamps with a future voting window):
 

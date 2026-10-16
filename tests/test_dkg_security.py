@@ -375,6 +375,14 @@ def test_round2_emits_accusation_that_unlocks_reveal(cluster):
     assert rev.json()["recipientIndex"] == 1
 
 
+def _fake_record():
+    """Just enough of an ElectionRecord for run_dkg_http's dispute step: a 2-of-3 committee."""
+    from types import SimpleNamespace
+
+    keypers = tuple(SimpleNamespace(signing_key=bytes([i]) * 20) for i in (1, 2, 3))
+    return SimpleNamespace(config=SimpleNamespace(threshold=SimpleNamespace(quorum=2), keypers=keypers))
+
+
 def test_run_dkg_http_repairs_then_publishes_despite_a_persistent_complaint(monkeypatch):
     """One member returning verified:false must NOT be able to halt the ceremony.
 
@@ -413,13 +421,20 @@ def test_run_dkg_http_repairs_then_publishes_despite_a_persistent_complaint(monk
         def get_finalized_key(self, _eid):
             return object()
 
+        def get_dkg_submissions(self, _eid):  # no earlier vote, so a full ceremony runs
+            return []
+
+        def get_election(self, _eid):
+            return _fake_record()
+
     assert coord.run_dkg_http(_EID, urls, api, _DL()) is True
 
-    # The accused dealer was asked to re-deal to its accuser, once per repair round...
-    assert seen.count("reveal_share") == coord._MAX_REPAIR_ROUNDS
+    # The accused dealer was asked to re-deal to its accuser once per repair round, then
+    # once more publicly. This fake answers without a share, so the dealer is excluded...
+    assert seen.count("reveal_share") == coord._MAX_REPAIR_ROUNDS + 1
     # ...the accuser was re-verified after each attempt (initial round2 on all 3, then the
-    # accuser alone on each retry)...
-    assert seen.count("round2") == 3 + coord._MAX_REPAIR_ROUNDS
+    # accuser alone on each retry), and everyone re-ran round 2 after the exclusion...
+    assert seen.count("round2") == 3 + coord._MAX_REPAIR_ROUNDS + 3
     # ...and the ceremony reached publish, for the two keypers that hold a verified share.
     assert seen.count("publish") == 2, "the persistent complainer must be skipped, not the ceremony"
 
@@ -456,6 +471,12 @@ def test_run_dkg_http_raises_when_the_quorum_cannot_publish(monkeypatch):
     class _DL:
         def get_finalized_key(self, _eid):
             return None
+
+        def get_dkg_submissions(self, _eid):
+            return []
+
+        def get_election(self, _eid):
+            return _fake_record()
 
     with pytest.raises(coord.DKGComplaint) as ei:
         coord.run_dkg_http(_EID, urls, api, _DL())

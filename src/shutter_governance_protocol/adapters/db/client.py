@@ -132,14 +132,17 @@ class HttpDataLayerClient(ElectionDataLayer):
 
     def list_ballots(self, election_id, start: int, count: int):
         d = self._get(f"/elections/{self._eid(election_id)}/ballots", start=start, count=count)
-        return [
-            StoredBallot(
+        out = []
+        for row in d["ballots"]:
+            # A malformed record arrives as ``"ballot": null`` with its reason.
+            envelope, reason = codecs.dec_stored_ballot(row.get("ballot"))
+            out.append(StoredBallot(
                 sequence_number=int(row["sequenceNumber"]),
-                envelope=codecs.dec_ballot(row["ballot"]),
+                envelope=envelope,
                 submitted_at=None if row.get("submittedAt") is None else int(row["submittedAt"]),
-            )
-            for row in d["ballots"]
-        ]
+                malformed_reason=row.get("malformed") or reason,
+            ))
+        return out
 
     def count_ballots(self, election_id) -> int:
         return int(self._get(f"/elections/{self._eid(election_id)}/ballots/count")["count"])
