@@ -151,21 +151,28 @@ DKG_REVEAL_DST = b"SHUTTER-GOVERNANCE-PROTOCOL-DKG-REVEAL-v1"
 from shutter_governance_protocol.crypto.params import CURVE_ORDER  # noqa: E402
 
 
-def dkg_commitments_digest(election_id: bytes, dealer_index: int, commitments: list[bytes]) -> bytes:
-    """Digest a dealer signs over the Feldman commitments it broadcasts."""
+def dkg_commitments_digest(election_id: bytes, dealer_index: int, commitments: list[bytes],
+                           session: bytes = b"") -> bytes:
+    """Digest a dealer signs over the Feldman commitments it broadcasts.
+
+    ``session`` is the coordinator's random id for this ceremony attempt. Each retry deals
+    a new vector, so without it a vector an honest dealer signed in an earlier attempt
+    could be replayed as "proof" that it equivocated in this one.
+    """
     parts = [
         DKG_COMMITMENTS_DST, bytes(election_id), int(dealer_index).to_bytes(8, "big"),
+        len(session).to_bytes(4, "big"), bytes(session),
         len(commitments).to_bytes(4, "big"), *(bytes(c) for c in commitments),
     ]
     return keccak(b"".join(parts))
 
 
 def proves_equivocation(election_id: bytes, dealer_index: int, dealer_address: bytes,
-                        reports: list[dict]) -> bool:
+                        reports: list[dict], session: bytes = b"") -> bool:
     """Whether ``reports`` hold two different commitment vectors both signed by the dealer.
 
     Each report is ``{"commitments": [hex, ...], "signature": "0x..."}``, as a keyper
-    received it. A dealer signs exactly one vector per election, so two distinct ones
+    received it. A dealer signs exactly one vector per ceremony session, so two distinct ones
     under its signature can only come from the dealer itself. Unsigned or malformed
     reports are ignored, so nobody can frame a dealer with a vector it never signed.
     """
@@ -174,7 +181,8 @@ def proves_equivocation(election_id: bytes, dealer_index: int, dealer_address: b
         try:
             vector = tuple(bytes.fromhex(h) for h in rep["commitments"])
             sig = bytes.fromhex(str(rep["signature"]).removeprefix("0x"))
-            if recover_digest(dkg_commitments_digest(election_id, dealer_index, list(vector)), sig) == dealer_address:
+            if recover_digest(dkg_commitments_digest(election_id, dealer_index, list(vector), session),
+                              sig) == dealer_address:
                 signed.add(vector)
         except Exception:  # noqa: BLE001 — a malformed report proves nothing
             continue

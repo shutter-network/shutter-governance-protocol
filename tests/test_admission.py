@@ -327,3 +327,14 @@ def test_weighted_election_admits_any_signed_weight(env):
     ballots = [_stored(env, 0, [3, 0, 0], P1, weight=79), _stored(env, 1, [0, 3, 0], P2, weight=1)]
     res = admit(ballots, cfg, env.mpk_bytes)
     assert res.total_admitted_weight == 80 and res.exclusions == ()
+
+
+def test_variant_b_election_admits_nothing(env):
+    """Ballot crypto is Variant A only. A Variant B config (refused at registration, but
+    reachable via the data layer or the contract) must not count Variant A ballots."""
+    from shutter_governance_protocol.core.config import Variant
+
+    cfg = env.config(variant=Variant.B)
+    res = admit([_stored(env, 0, [1, 0, 2], P1)], cfg, env.mpk_bytes)
+    assert list(res.admitted) == []
+    assert res.exclusions[0].reason is ExclusionReason.MALFORMED

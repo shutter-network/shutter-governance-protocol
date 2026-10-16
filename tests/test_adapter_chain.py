@@ -468,8 +468,8 @@ def _weight_zero_credential(env) -> bytes:
     return json.dumps(d).encode()
 
 
-@pytest.mark.parametrize("wr", [b"x", b"\xff", b"{}", b"[]", "weight0"],
-                         ids=["not-json", "not-utf8", "missing-fields", "wrong-shape", "weight-0"])
+@pytest.mark.parametrize("wr", [b"x", b"\xff", b"{}", b"[]", b"[" * 5_000, "weight0"],
+                         ids=["not-json", "not-utf8", "missing-fields", "wrong-shape", "deeply-nested", "weight-0"])
 def test_undecodable_credential_is_read_as_malformed(env, wr):
     """One undecodable record used to make every read that included it raise, which
     halted the keypers, the auditor and the ingest filter. It must read as a malformed

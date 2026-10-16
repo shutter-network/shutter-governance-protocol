@@ -306,7 +306,8 @@ def test_big_integer_fields_reject_non_decimal_strings():
             codecs.dec_ballot(wire)
 
 
-def test_dkg_submission_submitter_round_trips_and_is_optional():
+def test_dkg_submission_submitter_is_never_read_from_the_wire():
+    """A submitter claimed over HTTP is unsigned; only the chain adapter may set it."""
     from dataclasses import replace
 
     from shutter_governance_protocol.envelopes.types import DKGResultSubmission
@@ -316,7 +317,7 @@ def test_dkg_submission_submitter_round_trips_and_is_optional():
     assert "submitter" not in codecs.enc_dkg_result(sub)
     assert codecs.dec_dkg_result(codecs.enc_dkg_result(sub)) == sub
     with_sender = replace(sub, submitter=b"\x44" * 20)
-    assert codecs.dec_dkg_result(json.loads(json.dumps(codecs.enc_dkg_result(with_sender)))) == with_sender
+    assert codecs.dec_dkg_result(json.loads(json.dumps(codecs.enc_dkg_result(with_sender)))) == sub
 
 
 def test_chain_ballot_with_a_missing_or_wrong_proof_reads_as_malformed():

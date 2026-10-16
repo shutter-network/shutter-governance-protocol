@@ -251,6 +251,34 @@ def test_failed_stall_mark_is_retried_not_mistaken_for_an_admin_retry(kw, monkey
     assert outs[-1] == "tally_abandoned" and kw.dl.get_election(eid).tally_stalled is True
 
 
+def test_stall_mark_that_landed_despite_an_error_still_resumes_on_first_admin_clear(kw, monkeypatch):
+    """The mark write reports an error (a timeout) but actually lands. The admin's first
+    clear must resume the tally, not be re-marked straight away."""
+    from shutter_governance_protocol.services.coordinator import dkg_coordinator as coord
+
+    eid = kw.register(voting_start=1000, voting_end=2000)
+    watcher = kw.watcher()
+    assert watcher.scan_once()[eid.hex()] == "finalized"
+    kw.clock.set(2500)
+    monkeypatch.setattr(coord, "trigger_aggregate_http", lambda *a, **k: {1: "failed", 2: "failed", 3: "failed"})
+    real_mark = kw.dl.set_tally_stalled
+
+    def lands_then_times_out(eid_, stalled, *a, **k):
+        real_mark(eid_, stalled, *a, **k)
+        if stalled:
+            raise TimeoutError("response lost")
+    monkeypatch.setattr(kw.dl, "set_tally_stalled", lands_then_times_out)
+    for _ in range(watcher.max_tally_attempts):
+        watcher.scan_once()
+    assert watcher.scan_once()[eid.hex()] == "tally_stalled"
+
+    kw.dl.set_tally_stalled(
+        eid, False,
+        kw.admin.sign("tally_resume", eid, authz.request_nonce_payload(int(kw.clock()))),
+        int(kw.clock()))
+    assert watcher.scan_once()[eid.hex()] == "collecting_aggregate"
+
+
 def test_watcher_abandons_tally_when_decryption_never_finalizes(kw, monkeypatch):
     """A canonical aggregate forms but decryption shares never reach t+1 → the decrypt
     phase is also bounded by max_tally_attempts, then abandoned."""
@@ -433,6 +461,21 @@ def test_keyper_refuses_a_new_round1_after_publishing(kw):
     assert r.status_code == 409
 
 
+def test_new_round1_drops_an_unpublished_key_from_an_earlier_attempt(kw):
+    """A key fixed at round 2 but never voted for must not survive a fresh round 1: if
+    that attempt's round 2 then failed, a resume would publish a key nobody else holds."""
+    eid = kw.register()
+    watcher = AutoDKG(kw.dl, kw.coordinator, clock=kw.clock, backoff_base_s=1, backoff_cap_s=1)
+    with _failing_publish(kw, {1, 2, 3}):
+        assert watcher.scan_once()[eid.hex()] == "registered_retry"
+    assert eid.hex() in requests.get(kw.urls[1] + "/status", timeout=10).json()["elections"]
+    token = watcher._tokens_by_committee[tuple(sorted(kw.urls.items()))][1]
+    r = requests.post(kw.urls[1] + "/dkg/round1", json={"electionId": eid.hex()},
+                      headers={"Authorization": f"Bearer {token}"}, timeout=10)
+    assert r.status_code == 200
+    assert eid.hex() not in requests.get(kw.urls[1] + "/status", timeout=10).json()["elections"]
+
+
 # --------------------------------------------------------------------------- #
 #  A dealer that withholds shares or equivocates on its commitments
 # --------------------------------------------------------------------------- #
@@ -470,6 +513,21 @@ def _withheld_by(kw, dealer, recipients, *, times=None):
                 return _ok()
         return None
     return rule
+
+
+def test_commitments_withheld_from_one_keyper_are_supplied_at_round2(kw):
+    """3-of-3: dealer 3 never sends its commitments to keyper 2. Keyper 2 could then never
+    check a share from dealer 3 and so never publish, which let one dealer stop the key.
+    Round 2 now carries the agreed, dealer-signed commitments."""
+    targets = {kw.urls[2] + "/dkg/receive_commitments"}
+
+    def rule(url, body):
+        return _ok() if url in targets and body.get("dealerIndex") == 3 else None
+
+    eid = kw.register(t=3)
+    with _intercept(kw, rule):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    assert len(kw.dl.get_dkg_submissions(eid)) == 3
 
 
 def test_shares_that_never_arrive_are_settled_by_public_reveal(kw):
@@ -557,9 +615,10 @@ def test_a_share_lost_once_is_repaired_and_everyone_publishes(kw):
     assert len(kw.dl.get_dkg_submissions(eid)) == 3
 
 
-def _report_other_commitments(kw, reporter, dealer, *, signed_by_dealer):
+def _report_other_commitments(kw, reporter, dealer, *, signed_by_dealer, session=None):
     """Make keyper ``reporter`` report a different vector for ``dealer``, as if the dealer
-    had sent it a second set. ``signed_by_dealer=False`` forges the signature."""
+    had sent it a second set. ``signed_by_dealer=False`` forges the signature. ``session``
+    signs for another ceremony attempt instead of the current one."""
     from shutter_governance_protocol.core import write_auth
     from shutter_governance_protocol.crypto.dkg import KeyperDKGState
     from shutter_governance_protocol.crypto.points import g2_to_compressed
@@ -568,15 +627,19 @@ def _report_other_commitments(kw, reporter, dealer, *, signed_by_dealer):
 
     target = kw.urls[reporter] + "/dkg/commitments"
     real = requests.post
+    current = [b""]
 
     def post_and_rewrite(url, *a, **k):
+        if url.endswith("/dkg/round1"):
+            current[0] = bytes.fromhex(k["json"].get("session", ""))
         r = real(url, *a, **k)
         if url == target:
             eid = bytes.fromhex(k["json"]["electionId"])
             comms, _ = KeyperDKGState().round1(dealer, 3, 2)
             vector = [g2_to_compressed(c) for c in comms]
             key = kw.keyper_signers[dealer - 1 if signed_by_dealer else reporter - 1].private_key
-            sig = write_auth.sign_digest(key, write_auth.dkg_commitments_digest(eid, dealer, vector))
+            sig = write_auth.sign_digest(key, write_auth.dkg_commitments_digest(
+                eid, dealer, vector, current[0] if session is None else session))
             data = r.json()
             data["commitments"][str(dealer)] = {"commitments": [v.hex() for v in vector],
                                                 "signature": "0x" + sig.hex()}
@@ -606,6 +669,19 @@ def test_equivocation_that_would_leave_too_few_dealers_halts(kw):
     with mock.patch("requests.post", side_effect=_report_other_commitments(kw, 2, 3, signed_by_dealer=True)):
         assert kw.watcher().scan_once()[eid.hex()] == "dkg_complaint"
     assert kw.dl.get_finalized_key(eid) is None
+
+
+def test_vector_signed_in_an_earlier_attempt_does_not_frame_an_honest_dealer(kw, caplog):
+    """Every retry deals fresh commitments. A keyper replaying the vector an honest dealer
+    signed in an earlier attempt used to "prove" equivocation and get the dealer excluded
+    (or, at 3-of-3, end the election)."""
+    from unittest import mock
+
+    eid = kw.register(t=3)
+    replay = _report_other_commitments(kw, 2, 3, signed_by_dealer=True, session=b"earlier-attempt!")
+    with caplog.at_level("ERROR"), mock.patch("requests.post", side_effect=replay):
+        assert kw.watcher().scan_once()[eid.hex()] == "finalized"
+    assert "op=dkg_equivocation" not in caplog.text
 
 
 def test_keyper_refuses_an_exclusion_without_valid_evidence(kw):

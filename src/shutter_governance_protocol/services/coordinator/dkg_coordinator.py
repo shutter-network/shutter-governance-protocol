@@ -342,9 +342,12 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
                  "op=dkg status=%s election=%s", "finalized" if finalized else "resume_incomplete", eid_hex)
         return finalized
 
+    # A fresh id per attempt, bound into every dealer's commitment signature, so a vector
+    # signed in an earlier attempt cannot be replayed as evidence of equivocation now.
+    session = secrets.token_bytes(16)
     for phase in ("round1", "distribute_commitments"):
         for i in idxs:
-            call(i, phase)
+            call(i, phase, {"session": session.hex()} if phase == "round1" else None)
         _LOG.info("op=dkg phase=%s status=ok election=%s keypers=%d", phase, eid_hex, len(idxs))
 
     # Each keyper checks shares only against the commitments *it* received, so a dealer
@@ -360,7 +363,10 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
             config_cache.append(data_layer.get_election(election_id).config)
         return config_cache[0]
 
-    exclusions, agreed = _equivocation_exclusions(election_id, idxs, call, data_layer)
+    exclusions, agreed_reports = _equivocation_exclusions(election_id, idxs, call, data_layer, session)
+    agreed = {d: r["commitments"] for d, r in agreed_reports.items()}
+    agreed_body = {str(d): {"commitments": r["commitments"], "signature": r["signature"]}
+                   for d, r in agreed_reports.items()}
     remaining = len(idxs) - len(exclusions)
     if exclusions and remaining < config().threshold.quorum:
         raise DKGEquivocation(
@@ -379,7 +385,9 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
         """Run round 2 on `targets`; return {accuser: [accusation, ...]} for the failures."""
         out = {}
         for i in targets:
-            resp = call(i, "round2", body_for(i))
+            # Every round 2 carries the agreed commitments, so each keyper checks shares
+            # against the same vectors, including one it never received or got late.
+            resp = call(i, "round2", {"agreed": agreed_body, **(body_for(i) or {})})
             if isinstance(resp, dict) and resp.get("verified") is False:
                 out[i] = resp.get("accusations", [])
         return out
@@ -493,12 +501,13 @@ def run_dkg_http(election_id: bytes, keyper_urls: dict[int, str], api_tokens: di
     return finalized
 
 
-def _equivocation_exclusions(election_id: bytes, idxs, call, data_layer: ElectionDataLayer):
+def _equivocation_exclusions(election_id: bytes, idxs, call, data_layer: ElectionDataLayer,
+                             session: bytes = b""):
     """Find dealers that signed two different commitment vectors.
 
     Returns ``(exclusions, agreed)``: the exclusions for the equivocating dealers, and,
-    for every other dealer, the one commitment vector (hex) the keypers agree on, which
-    a publicly revealed share is later checked against.
+    for every other dealer, the one signed report of the commitment vector the keypers
+    agree on, which round 2 and a publicly revealed share are later checked against.
 
     Each exclusion is ``{"dealer", "reason": "equivocation", "evidence": [report, ...]}``,
     the form ``/dkg/round2`` verifies. Only dealer-signed vectors count, so a keyper
@@ -522,7 +531,8 @@ def _equivocation_exclusions(election_id: bytes, idxs, call, data_layer: Electio
                 vector = tuple(bytes.fromhex(h) for h in row["commitments"])
                 sig = bytes.fromhex(str(row["signature"]).removeprefix("0x"))
                 signed = write_auth.recover_digest(
-                    write_auth.dkg_commitments_digest(election_id, dealer, list(vector)), sig) == members.get(dealer)
+                    write_auth.dkg_commitments_digest(election_id, dealer, list(vector), session),
+                    sig) == members.get(dealer)
             except Exception:  # noqa: BLE001 — malformed report: treated as unsigned
                 signed = False
             if not signed:
@@ -542,7 +552,7 @@ def _equivocation_exclusions(election_id: bytes, idxs, call, data_layer: Electio
     _LOG.log(logging.WARNING if exclusions else logging.INFO,
              "op=dkg phase=check_commitments status=%s election=%s dealers=%d excluded=%s",
              "excluding" if exclusions else "ok", eid_hex, len(seen), [x["dealer"] for x in exclusions])
-    agreed = {d: next(iter(v.values()))["commitments"] for d, v in seen.items() if len(v) == 1}
+    agreed = {d: next(iter(v.values())) for d, v in seen.items() if len(v) == 1}
     return exclusions, agreed
 
 

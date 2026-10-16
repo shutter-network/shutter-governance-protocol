@@ -286,11 +286,17 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
             if entry is not None and entry.published:
                 log.warning("op=dkg phase=round1 status=refused election=%s reason=already_published", eid_hex)
                 abort(409, "this keyper already published a key for this election; resume with /dkg/publish")
+            if entry is not None:
+                # Unpublished key from an earlier attempt: drop it, or a later resume could
+                # publish a key no other keyper holds if this attempt's round 2 fails.
+                del completed[eid_hex]
+                persist.save_dkg_secrets(fernet, completed, state_dir)
             st = KeyperDKGState()
             st.round1(idx, n, quorum)
             dkg_states[eid_hex] = st
             _inbox(eid_hex)  # reset/init
-            inbox[eid_hex] = {"commitments": {idx: st.commitments}, "shares": {idx: st.shares_for_others[idx]}}
+            inbox[eid_hex] = {"commitments": {idx: st.commitments}, "shares": {idx: st.shares_for_others[idx]},
+                              "session": bytes.fromhex(str(body.get("session") or ""))}
         return jsonify(ok=True, index=idx)
 
     @app.post("/dkg/distribute_commitments")
@@ -303,7 +309,9 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         commitments_hex = [c.hex() for c in commitments_c]
         # Sign the commitments so a recipient can bind them to this dealer's member
         # address (defeats a peer injecting forged commitments for another dealer).
-        sig = write_auth.sign_digest(signer.private_key, write_auth.dkg_commitments_digest(eid, idx, commitments_c))
+        session = _inbox(eid_hex).get("session", b"")
+        sig = write_auth.sign_digest(signer.private_key,
+                                     write_auth.dkg_commitments_digest(eid, idx, commitments_c, session))
         with lock:
             _inbox(eid_hex).setdefault("commitment_sigs", {})[idx] = "0x" + sig.hex()
         for peer_index in range(1, config.threshold.n + 1):
@@ -327,7 +335,8 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         try:
             sig = bytes.fromhex(str(body["signature"]).removeprefix("0x"))
             ok = dealer_addr is not None and \
-                write_auth.recover_digest(write_auth.dkg_commitments_digest(eid, dealer, incoming), sig) == dealer_addr
+                write_auth.recover_digest(write_auth.dkg_commitments_digest(
+                    eid, dealer, incoming, _inbox(eid_hex).get("session", b"")), sig) == dealer_addr
         except (KeyError, ValueError, TypeError):
             ok = False
         if not ok:
@@ -499,7 +508,8 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
             addr = _members_addr(config, dealer)
             if reason == "equivocation":
                 proven = addr is not None and \
-                    write_auth.proves_equivocation(eid, dealer, addr, item.get("evidence") or [])
+                    write_auth.proves_equivocation(eid, dealer, addr, item.get("evidence") or [],
+                                                   _inbox(eid.hex()).get("session", b""))
             elif reason == "no_valid_reveal":
                 # Not a proof that the dealer cheated, only a signed accusation it failed to
                 # answer. That is enough: excluding a dealer drops only its contribution to
@@ -531,6 +541,33 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
                 write_auth.recover_digest(write_auth.dkg_accusation_digest(eid, dealer, recipient), sig) == member
         except Exception:  # noqa: BLE001 — malformed accusation
             return False
+
+    def _adopt_agreed_commitments(eid: bytes, config, box: dict, my_idx: int, agreed: dict) -> None:
+        """Hold exactly the commitments every keyper agreed on, each checked against its
+        dealer's signature for this session.
+
+        A dealer could otherwise withhold its commitments from one keyper (which then can
+        never accept a revealed share), or send it a second vector after the coordinator's
+        equivocation check, so that keyper ends up on a different key.
+        """
+        session = box.get("session", b"")
+        for dealer_s, row in agreed.items():
+            try:
+                dealer = int(dealer_s)
+                vector = [bytes.fromhex(h) for h in row["commitments"]]
+                sig = bytes.fromhex(str(row["signature"]).removeprefix("0x"))
+                addr = _members_addr(config, dealer)
+                ok = (dealer != my_idx and addr is not None and len(vector) == config.threshold.quorum
+                      and write_auth.recover_digest(
+                          write_auth.dkg_commitments_digest(eid, dealer, vector, session), sig) == addr)
+                points = [g2_from_compressed(b) for b in vector] if ok else None
+            except Exception:  # noqa: BLE001 — malformed: ignored, round 2 then complains
+                ok = False
+            if not ok:
+                continue
+            with lock:
+                box["commitments"][dealer] = points
+                box.setdefault("commitment_sigs", {})[dealer] = row["signature"]
 
     def _accept_revealed_shares(eid: bytes, config, box: dict, my_idx: int, revealed: list) -> None:
         """Store shares a dealer revealed publicly for this keyper, after checking them.
@@ -567,6 +604,7 @@ def build_keyper_app(signer, data_layer, trusted_identities, *, clock, state_dir
         box = _inbox(eid_hex)
         my_idx = _my_index(config)
         excluded = _verified_exclusions(eid, config, body.get("excluded") or [])
+        _adopt_agreed_commitments(eid, config, box, my_idx, body.get("agreed") or {})
         _accept_revealed_shares(eid, config, box, my_idx, body.get("revealed") or [])
         n, quorum = config.threshold.n, config.threshold.quorum
         dealers = [d for d in range(1, n + 1) if d not in excluded]

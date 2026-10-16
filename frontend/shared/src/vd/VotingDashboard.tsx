@@ -286,8 +286,9 @@ export function VotingDashboard({ electionId, elections, onSelectElection, heade
   const detailBallot = detailView ? (ballots[detailView.globalIndex - page * PAGE_SIZE] ?? null) : null;
   // Recorded (every stored ballot) vs counted (distinct pseudonyms, last-wins). Fall back to
   // recorded until the status pass has run, so we never flash a premature "0 counted".
+  // Once the tally is published its count is final, even when it is 0.
   const recordedBallots = Number(overviewBallotTotal);
-  const countedBallots = statuses.counted || recordedBallots;
+  const countedBallots = statuses.final ? statuses.counted : (statuses.counted || recordedBallots);
   const supersededBallots = statuses.superseded.size;
   const isTriple =
     (showVerifyPanel && tab === "ballots" && !!detailBallot && !!detailView) ||

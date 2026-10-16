@@ -178,6 +178,10 @@ class AutoDKG:
             # The persisted flag is authoritative: the coordinator does NOT drive a stalled
             # tally (a restart never resurrects it). Only the admin's clearTallyStalled
             # (retry) flips it back to Tallying, and the next poll resumes with a fresh budget.
+            # A mark that landed although its write reported an error is now confirmed.
+            if eid_hex in self._stall_owed:
+                self._stall_owed.discard(eid_hex)
+                self._stall_marked.add(eid_hex)
             return "tally_stalled"
         return "not_ready"  # KeyReady / Voting / Cancelled
 

@@ -171,8 +171,9 @@ def dec_attestation(d: Any, *, name: str = "attestation") -> Attestation:
 
 #: What decoding untrusted ballot data can raise. ``CodecError``, ``JSONDecodeError`` and
 #: ``UnicodeDecodeError`` are all ``ValueError``s; the others come from JSON of the wrong
-#: shape (a list or a number where an object belongs).
-BALLOT_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError)
+#: shape (a list or a number where an object belongs), and ``RecursionError`` from
+#: deeply nested JSON.
+BALLOT_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, RecursionError)
 
 
 def dec_stored_ballot(d: Any) -> tuple[BallotEnvelope | None, str | None]:
@@ -245,7 +246,9 @@ def dec_dkg_result(d: Any) -> DKGResultSubmission:
             dec_bytes(p, name=f"committeePKs[{i}]", size=G2_BYTES) for i, p in enumerate(pks)
         ),
         keyper_signature=dec_bytes(_req(d, "keyperSignature"), name="keyperSignature"),
-        submitter=dec_bytes(d["submitter"], name="submitter", size=20) if d.get("submitter") else None,
+        # ``submitter`` is deliberately not read back: it is an unsigned claim, trusted
+        # only when the chain adapter reads it from the contract itself. Accepting it from
+        # the wire would let a dishonest data layer forge DKG votes the auditor counts.
     )
 
 

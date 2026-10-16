@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from shutter_governance_protocol.core.config import DuplicatePolicy, ElectionConfig
+from shutter_governance_protocol.core.config import DuplicatePolicy, ElectionConfig, Variant
 from shutter_governance_protocol.crypto.ballot import verify_ballot_crypto
 from shutter_governance_protocol.crypto.points import g2_from_compressed
 from shutter_governance_protocol.envelopes.types import BallotEnvelope, Exclusion, ExclusionReason, StoredBallot
@@ -62,8 +62,9 @@ def validate_ballot(sb: StoredBallot, config: ElectionConfig, mpk) -> ExclusionR
         return ExclusionReason.MALFORMED
     att = env.attestation
 
-    # Wrong-election binding / structural mismatch.
-    if env.election_id != config.election_id:
+    # Wrong-election binding / structural mismatch. Ballot crypto implements Variant A
+    # only, so a Variant B election (refused at registration) admits nothing.
+    if env.election_id != config.election_id or config.variant != Variant.A:
         return ExclusionReason.MALFORMED
 
     # Out-of-window (only when the adapter supplies an authoritative time).

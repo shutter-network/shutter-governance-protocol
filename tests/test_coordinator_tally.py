@@ -235,12 +235,16 @@ def test_real_equivocation_over_http_is_excluded_and_the_tally_completes(world):
     vector_b = [g2_to_compressed(c) for c in comms_b]
     real = rq.post
 
+    session = [b""]
+
     def post(url, *a, **k):
         body = dict(k.get("json") or {})
+        if url.endswith("/dkg/round1"):
+            session[0] = bytes.fromhex(body.get("session", ""))
         if url == w.urls[2] + "/dkg/receive_commitments" and body.get("dealerIndex") == 3:
             body["commitments"] = [v.hex() for v in vector_b]
             body["signature"] = "0x" + write_auth.sign_digest(
-                dealer_key, write_auth.dkg_commitments_digest(eid, 3, vector_b)).hex()
+                dealer_key, write_auth.dkg_commitments_digest(eid, 3, vector_b, session[0])).hex()
             k = {**k, "json": body}
         elif url == w.urls[2] + "/dkg/receive_share" and body.get("dealerIndex") == 3:
             st = rq.get(w.urls[2] + "/status", timeout=10).json()
